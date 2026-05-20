@@ -1,542 +1,783 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useRef } from "react";
 
 const TAX_RATE = 0.33;
-const GARCOM_RATE = 0.29;
+const INDIVIDUAL_RATE = 0.29;
+const HISTORY_KEY = "maguje_history";
+const APP_PASSWORD = "maguje2026"; // ← altere aqui para a senha que quiser
+const SESSION_KEY = "maguje_auth";
+
+function LoginScreen({ onLogin }) {
+  const [pwd, setPwd] = useState("");
+  const [error, setError] = useState(false);
+  const [shake, setShake] = useState(false);
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (pwd === APP_PASSWORD) {
+      sessionStorage.setItem(SESSION_KEY, "1");
+      onLogin();
+    } else {
+      setError(true);
+      setShake(true);
+      setPwd("");
+      setTimeout(() => setShake(false), 500);
+    }
+  };
+
+  return (
+    <div style={{ fontFamily:"'DM Mono','Courier New',monospace", background:"#F5F0E8", minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Space+Grotesk:wght@500;700&display=swap');
+        * { box-sizing: border-box; }
+        @keyframes shake {
+          0%,100% { transform: translateX(0); }
+          20%,60% { transform: translateX(-8px); }
+          40%,80% { transform: translateX(8px); }
+        }
+        .shake { animation: shake 0.4s ease; }
+        input:focus { outline: none; border-color: #2D6A4F !important; }
+      `}</style>
+      <div style={{ width: "100%", maxWidth: 380, padding: "0 20px" }}>
+        {/* Logo area */}
+        <div style={{ textAlign:"center", marginBottom: 36 }}>
+          <div style={{ width: 56, height: 56, background:"#1B4332", borderRadius: 12, margin:"0 auto 16px", display:"flex", alignItems:"center", justifyContent:"center" }}>
+            <span style={{ fontSize: 26 }}>🌿</span>
+          </div>
+          <div style={{ fontFamily:"'Space Grotesk',sans-serif", fontWeight:700, fontSize:22, color:"#1B4332" }}>Maguje</div>
+          <div style={{ fontSize:12, color:"#888", marginTop:4 }}>Sistema de Comissões</div>
+        </div>
+
+        {/* Card */}
+        <div className={shake ? "shake" : ""} style={{ background:"#fff", border:"1.5px solid #D4CFC4", borderRadius:6, padding:"28px 28px 24px" }}>
+          <div style={{ fontSize:13, fontWeight:500, color:"#333", marginBottom:20 }}>Acesso restrito</div>
+          <form onSubmit={handleSubmit}>
+            <div style={{ marginBottom:16 }}>
+              <div style={{ fontSize:11, color:"#666", textTransform:"uppercase", letterSpacing:"0.08em", marginBottom:6 }}>Senha</div>
+              <input
+                type="password"
+                placeholder="••••••••"
+                value={pwd}
+                onChange={e => { setPwd(e.target.value); setError(false); }}
+                autoFocus
+                style={{ background:"#F5F0E8", border:`1.5px solid ${error?"#c0392b":"#ccc"}`, borderRadius:3, padding:"10px 12px", fontFamily:"inherit", fontSize:14, width:"100%", letterSpacing:"0.1em" }}
+              />
+              {error && <div style={{ fontSize:11, color:"#c0392b", marginTop:6 }}>Senha incorreta. Tente novamente.</div>}
+            </div>
+            <button type="submit" style={{ width:"100%", border:"none", background:"#1B4332", color:"#fff", padding:"11px", borderRadius:3, cursor:"pointer", fontFamily:"inherit", fontSize:13, fontWeight:500, letterSpacing:"0.02em" }}>
+              Entrar →
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function getWorkingDays(year, month) {
+  const days = [];
+  const total = new Date(year, month, 0).getDate();
+  for (let d = 1; d <= total; d++) {
+    if (new Date(year, month - 1, d).getDay() !== 1) days.push(d);
+  }
+  return days;
+}
+
+const DOW_LABELS = ["Dom","","Ter","Qua","Qui","Sex","Sáb"];
+const fmt = (v) => (v || 0).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+const fmtShort = (v) => (v||0).toLocaleString("pt-BR",{minimumFractionDigits:2,maximumFractionDigits:2});
 
 const INITIAL_EMPLOYEES = [
-  // SALÃO - Equipe Global (Cumins/Suiteiro)
-  { id: 1, name: "Jean Carlos Fidelis", role: "Cumim", sector: "Salão", type: "global", points: 15 },
-  { id: 2, name: "Claudia Elisabete Conceição", role: "Cumim", sector: "Salão", type: "global", points: 15 },
-  { id: 3, name: "Marcos Vinicius Henrique de Souza", role: "Cumim", sector: "Salão", type: "global", points: 15 },
-  { id: 4, name: "Maria Elenice Ferreira", role: "Cumim", sector: "Salão", type: "global", points: 15 },
-  { id: 5, name: "Rodrigo de Pinho Ribeiro", role: "Cumim", sector: "Salão", type: "global", points: 15 },
-  { id: 6, name: "Felipe Costa de Abreu", role: "Suiteiro", sector: "Salão", type: "global", points: 20 },
-  // SALÃO - Garçons (comissão individual)
-  { id: 7, name: "Douglas Pereira Lima", role: "Garçom", sector: "Salão", type: "garcom", points: 0 },
-  { id: 8, name: "Gabriel de Farias Pereira", role: "Garçom", sector: "Salão", type: "garcom", points: 0 },
-  { id: 9, name: "Gustavo Fabricio Rodrigues Freire", role: "Garçom", sector: "Salão", type: "garcom", points: 0 },
-  { id: 10, name: "Antonia Erineuda", role: "Garçonete", sector: "Salão", type: "garcom", points: 0 },
-  { id: 11, name: "Paulo Alves de Almeida", role: "Garçom", sector: "Salão", type: "garcom", points: 0 },
-  // SALÃO - Chefes e Gestão (global)
-  { id: 12, name: "Reinaldo Alves de Oliveira", role: "Chefe de Fila Junior", sector: "Salão", type: "global", points: 24 },
-  { id: 13, name: "Jeane Rodrigues", role: "Chefe de Fila Junior", sector: "Salão", type: "global", points: 24 },
-  { id: 14, name: "Verinaldo Gabriel da Rocha", role: "Chefe de Fila Junior", sector: "Salão", type: "global", points: 24 },
-  { id: 15, name: "Crislandia Moura de Lima", role: "Chefe de Fila Pleno", sector: "Salão", type: "global", points: 26 },
-  { id: 16, name: "Elizangelo Araujo Miranda", role: "Maître", sector: "Salão", type: "global", points: 30 },
-  { id: 17, name: "Joaquim Fernandes Gomes", role: "Assistente Gerente", sector: "Salão", type: "global", points: 25 },
-  { id: 18, name: "Jose Edilson Pereira Nogueira", role: "Sub Gerente / Maître", sector: "Salão", type: "global", points: 30 },
-  { id: 19, name: "Rodrigo Florentino Fonseca", role: "Gerente", sector: "Salão", type: "global", points: 35 },
-  { id: 20, name: "Fabio da Silva Miguel", role: "Assistente MKT", sector: "Salão", type: "global", points: 15 },
-  { id: 21, name: "Kayllana Vitoria de Oliveira Donato", role: "Hostess", sector: "Salão", type: "global", points: 15 },
-  { id: 22, name: "Suzana Radai Estrela Souza", role: "Hostess", sector: "Salão", type: "global", points: 15 },
-  { id: 23, name: "Romenia Fernades Jorge", role: "Hostess", sector: "Salão", type: "global", points: 20 },
-  // BAR
-  { id: 24, name: "Danilo Silva Gomes", role: "Barback", sector: "Bar", type: "global", points: 17 },
-  { id: 25, name: "Luan Chrystyan dos Santos", role: "Barback", sector: "Bar", type: "global", points: 17 },
-  { id: 26, name: "Francisco Tome da Silva", role: "Copeiro II", sector: "Bar", type: "global", points: 10 },
-  { id: 27, name: "Antonio Mauricio Santos Soares", role: "Bartender", sector: "Bar", type: "global", points: 20 },
-  { id: 28, name: "Rafael da Silva Romualdo", role: "Bartender", sector: "Bar", type: "global", points: 20 },
-  { id: 29, name: "Caio Henriques Rodrigues", role: "Bartender", sector: "Bar", type: "global", points: 20 },
-  { id: 30, name: "Gabriel Paulino Barbosa", role: "Bartender", sector: "Bar", type: "global", points: 20 },
-  { id: 31, name: "Gabriel Soares Grativol", role: "Bartender", sector: "Bar", type: "global", points: 20 },
-  { id: 32, name: "Gabriel de Oliveira Fernandes", role: "Sub Chefe de Bar", sector: "Bar", type: "global", points: 22 },
-  { id: 33, name: "Luiz Gustavo Mesquita Soares", role: "Chefe de Bar", sector: "Bar", type: "global", points: 25 },
-  // CAIXA
-  { id: 34, name: "Antonia Jacilane de Sousa Costa", role: "Caixa", sector: "Caixa", type: "global", points: 15 },
-  // COZINHA
-  { id: 35, name: "Antonio Gomes de Sousa", role: "Copeiro", sector: "Cozinha", type: "global", points: 15 },
-  { id: 36, name: "Douglas Leite Gonçalves", role: "Copeiro", sector: "Cozinha", type: "global", points: 15 },
-  { id: 37, name: "John Victor Santos do Nascimento", role: "Copeiro", sector: "Cozinha", type: "global", points: 15 },
-  { id: 38, name: "Rosangela Costa Rodrigues", role: "Copeiro", sector: "Cozinha", type: "global", points: 15 },
-  { id: 39, name: "Robert Gustavo Santos de Souza", role: "Copeiro", sector: "Cozinha", type: "global", points: 15 },
-  { id: 40, name: "Daniel Pereira do Sacramento", role: "Padeiro", sector: "Cozinha", type: "global", points: 15 },
-  { id: 41, name: "Rosinaldo Pedro Soares", role: "Ajudante de Cozinha", sector: "Cozinha", type: "global", points: 15 },
-  { id: 42, name: "Thaynara Tonelle Costa", role: "Cozinheiro I", sector: "Cozinha", type: "global", points: 15 },
-  { id: 43, name: "Andre Felizardo Verissimo", role: "Cozinheiro I", sector: "Cozinha", type: "global", points: 15 },
-  { id: 44, name: "Dayveson Rafael da Silva", role: "Cozinheiro I", sector: "Cozinha", type: "global", points: 15 },
-  { id: 45, name: "Andriely Firmino da Silva", role: "Cozinheiro I", sector: "Cozinha", type: "global", points: 15 },
-  { id: 46, name: "Vitor Faria de Oliveira Aguilera", role: "Cozinheiro I", sector: "Cozinha", type: "global", points: 15 },
-  { id: 47, name: "Lucas Barbosa Ribeiro Borges", role: "Cozinheiro II", sector: "Cozinha", type: "global", points: 19 },
-  { id: 48, name: "Robson Roberto da Silva", role: "Cozinheiro II", sector: "Cozinha", type: "global", points: 19 },
-  { id: 49, name: "Wagner Pinto", role: "Cozinheiro III", sector: "Cozinha", type: "global", points: 21 },
-  { id: 50, name: "Francisco Dalvan Bezerra Gomes", role: "Cozinheiro III", sector: "Cozinha", type: "global", points: 21 },
-  { id: 51, name: "Valdemir Galdino de Oliveira", role: "Cozinheiro III", sector: "Cozinha", type: "global", points: 21 },
-  { id: 52, name: "Luis Augusto Souza da Costa", role: "Cozinheiro Líder", sector: "Cozinha", type: "global", points: 23 },
-  { id: 53, name: "Jaqueline de Souza Galvao", role: "Sub Chefe Cozinha", sector: "Cozinha", type: "global", points: 25 },
-  { id: 54, name: "Eduardo", role: "Chef Produções Gast.", sector: "Cozinha", type: "global", points: 30 },
-  // LIMPEZA
-  { id: 55, name: "Alex dos Santos", role: "ASG", sector: "Limpeza", type: "global", points: 10 },
-  { id: 56, name: "Carlos Daniel Alves de Lima", role: "ASG", sector: "Limpeza", type: "global", points: 10 },
-  { id: 57, name: "Marlucia Santana Rodrigues", role: "Líder de ASG", sector: "Limpeza", type: "global", points: 20 },
-  { id: 58, name: "José Roberto Inácio da Silva", role: "Estoquista", sector: "Limpeza", type: "global", points: 10 },
+  { id: 1,  name: "Douglas Pereira Lima",              role: "Garçom",              sector: "Salão",   type: "individual", points: 0 },
+  { id: 2,  name: "Gabriel de Farias Pereira",         role: "Garçom",              sector: "Salão",   type: "individual", points: 0 },
+  { id: 3,  name: "Gustavo Fabricio Rodrigues Freire", role: "Garçom",              sector: "Salão",   type: "individual", points: 0 },
+  { id: 4,  name: "Antonia Erineuda",                  role: "Garçonete",           sector: "Salão",   type: "individual", points: 0 },
+  { id: 5,  name: "Paulo Alves de Almeida",            role: "Garçom",              sector: "Salão",   type: "individual", points: 0 },
+  { id: 6,  name: "Reinaldo Alves de Oliveira",        role: "Chefe de Fila Junior",sector: "Salão",   type: "individual", points: 0 },
+  { id: 7,  name: "Jeane Rodrigues",                   role: "Chefe de Fila Junior",sector: "Salão",   type: "individual", points: 0 },
+  { id: 8,  name: "Verinaldo Gabriel da Rocha",        role: "Chefe de Fila Junior",sector: "Salão",   type: "individual", points: 0 },
+  { id: 9,  name: "Jean Carlos Fidelis",               role: "Cumim",               sector: "Salão",   type: "global", points: 15 },
+  { id: 10, name: "Claudia Elisabete Conceição",       role: "Cumim",               sector: "Salão",   type: "global", points: 15 },
+  { id: 11, name: "Marcos Vinicius Henrique de Souza", role: "Cumim",               sector: "Salão",   type: "global", points: 15 },
+  { id: 12, name: "Maria Elenice Ferreira",            role: "Cumim",               sector: "Salão",   type: "global", points: 15 },
+  { id: 13, name: "Rodrigo de Pinho Ribeiro",          role: "Cumim",               sector: "Salão",   type: "global", points: 15 },
+  { id: 14, name: "Felipe Costa de Abreu",             role: "Suiteiro",            sector: "Salão",   type: "global", points: 20 },
+  { id: 15, name: "Crislandia Moura de Lima",          role: "Chefe de Fila Pleno", sector: "Salão",   type: "global", points: 26 },
+  { id: 16, name: "Elizangelo Araujo Miranda",         role: "Maître",              sector: "Salão",   type: "global", points: 30 },
+  { id: 17, name: "Joaquim Fernandes Gomes",           role: "Assistente Gerente",  sector: "Salão",   type: "global", points: 25 },
+  { id: 18, name: "Jose Edilson Pereira Nogueira",     role: "Sub Gerente / Maître",sector: "Salão",   type: "global", points: 30 },
+  { id: 19, name: "Rodrigo Florentino Fonseca",        role: "Gerente",             sector: "Salão",   type: "global", points: 35 },
+  { id: 20, name: "Fabio da Silva Miguel",             role: "Assistente MKT",      sector: "Salão",   type: "global", points: 15 },
+  { id: 21, name: "Kayllana Vitoria de Oliveira",      role: "Hostess",             sector: "Salão",   type: "global", points: 15 },
+  { id: 22, name: "Suzana Radai Estrela Souza",        role: "Hostess",             sector: "Salão",   type: "global", points: 15 },
+  { id: 23, name: "Romenia Fernades Jorge",            role: "Hostess",             sector: "Salão",   type: "global", points: 20 },
+  { id: 24, name: "Danilo Silva Gomes",                role: "Barback",             sector: "Bar",     type: "global", points: 17 },
+  { id: 25, name: "Luan Chrystyan dos Santos",         role: "Barback",             sector: "Bar",     type: "global", points: 17 },
+  { id: 26, name: "Francisco Tome da Silva",           role: "Copeiro II",          sector: "Bar",     type: "global", points: 10 },
+  { id: 27, name: "Antonio Mauricio Santos Soares",    role: "Bartender",           sector: "Bar",     type: "global", points: 20 },
+  { id: 28, name: "Rafael da Silva Romualdo",          role: "Bartender",           sector: "Bar",     type: "global", points: 20 },
+  { id: 29, name: "Caio Henriques Rodrigues",          role: "Bartender",           sector: "Bar",     type: "global", points: 20 },
+  { id: 30, name: "Gabriel Paulino Barbosa",           role: "Bartender",           sector: "Bar",     type: "global", points: 20 },
+  { id: 31, name: "Gabriel Soares Grativol",           role: "Bartender",           sector: "Bar",     type: "global", points: 20 },
+  { id: 32, name: "Gabriel de Oliveira Fernandes",     role: "Sub Chefe de Bar",    sector: "Bar",     type: "global", points: 22 },
+  { id: 33, name: "Luiz Gustavo Mesquita Soares",      role: "Chefe de Bar",        sector: "Bar",     type: "global", points: 25 },
+  { id: 34, name: "Antonia Jacilane de Sousa Costa",   role: "Caixa",               sector: "Caixa",   type: "global", points: 15 },
+  { id: 35, name: "Antonio Gomes de Sousa",            role: "Copeiro",             sector: "Cozinha", type: "global", points: 15 },
+  { id: 36, name: "Douglas Leite Gonçalves",           role: "Copeiro",             sector: "Cozinha", type: "global", points: 15 },
+  { id: 37, name: "John Victor Santos do Nascimento",  role: "Copeiro",             sector: "Cozinha", type: "global", points: 15 },
+  { id: 38, name: "Rosangela Costa Rodrigues",         role: "Copeiro",             sector: "Cozinha", type: "global", points: 15 },
+  { id: 39, name: "Robert Gustavo Santos de Souza",    role: "Copeiro",             sector: "Cozinha", type: "global", points: 15 },
+  { id: 40, name: "Daniel Pereira do Sacramento",      role: "Padeiro",             sector: "Cozinha", type: "global", points: 15 },
+  { id: 41, name: "Rosinaldo Pedro Soares",            role: "Ajudante de Cozinha", sector: "Cozinha", type: "global", points: 15 },
+  { id: 42, name: "Thaynara Tonelle Costa",            role: "Cozinheiro I",        sector: "Cozinha", type: "global", points: 15 },
+  { id: 43, name: "Andre Felizardo Verissimo",         role: "Cozinheiro I",        sector: "Cozinha", type: "global", points: 15 },
+  { id: 44, name: "Dayveson Rafael da Silva",          role: "Cozinheiro I",        sector: "Cozinha", type: "global", points: 15 },
+  { id: 45, name: "Andriely Firmino da Silva",         role: "Cozinheiro I",        sector: "Cozinha", type: "global", points: 15 },
+  { id: 46, name: "Vitor Faria de Oliveira Aguilera",  role: "Cozinheiro I",        sector: "Cozinha", type: "global", points: 15 },
+  { id: 47, name: "Lucas Barbosa Ribeiro Borges",      role: "Cozinheiro II",       sector: "Cozinha", type: "global", points: 19 },
+  { id: 48, name: "Robson Roberto da Silva",           role: "Cozinheiro II",       sector: "Cozinha", type: "global", points: 19 },
+  { id: 49, name: "Wagner Pinto",                      role: "Cozinheiro III",      sector: "Cozinha", type: "global", points: 21 },
+  { id: 50, name: "Francisco Dalvan Bezerra Gomes",    role: "Cozinheiro III",      sector: "Cozinha", type: "global", points: 21 },
+  { id: 51, name: "Valdemir Galdino de Oliveira",      role: "Cozinheiro III",      sector: "Cozinha", type: "global", points: 21 },
+  { id: 52, name: "Luis Augusto Souza da Costa",       role: "Cozinheiro Líder",    sector: "Cozinha", type: "global", points: 23 },
+  { id: 53, name: "Jaqueline de Souza Galvao",         role: "Sub Chefe Cozinha",   sector: "Cozinha", type: "global", points: 25 },
+  { id: 54, name: "Eduardo",                           role: "Chef Produções Gast.",sector: "Cozinha", type: "global", points: 30 },
+  { id: 55, name: "Alex dos Santos",                   role: "ASG",                 sector: "Limpeza", type: "global", points: 10 },
+  { id: 56, name: "Carlos Daniel Alves de Lima",       role: "ASG",                 sector: "Limpeza", type: "global", points: 10 },
+  { id: 57, name: "Marlucia Santana Rodrigues",        role: "Líder de ASG",        sector: "Limpeza", type: "global", points: 20 },
+  { id: 58, name: "José Roberto Inácio da Silva",      role: "Estoquista",          sector: "Limpeza", type: "global", points: 10 },
 ];
 
-const SECTORS = ["Todos", "Salão", "Bar", "Caixa", "Cozinha", "Limpeza"];
+const SECTORS = ["Todos","Salão","Bar","Caixa","Cozinha","Limpeza"];
+const SECTOR_COLORS = { Salão:"#2D6A4F", Bar:"#1B4332", Caixa:"#40916C", Cozinha:"#B5450B", Limpeza:"#7B5EA7" };
 
-const fmt = (v) => v.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+function loadHistory() {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]"); } catch { return []; }
+}
+function saveHistory(records) {
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(records));
+}
 
-function initState(employees) {
-  const sales = {};
-  const absences = {};
-  employees.forEach((e) => {
-    sales[e.id] = e.type === "garcom" ? "" : "";
-    absences[e.id] = 0;
+function calcResults(employees, workDays, dailyRevenue, absences, year, mon) {
+  const indivEmployees = employees.filter(e => e.type === "individual");
+  const globalEmployees = employees.filter(e => e.type === "global");
+  const isAbsent = (empId, day) => !!(absences[empId]||{})[day];
+  const getDayRevenue = (day) => dailyRevenue[day] || { global:"", individual:{} };
+
+  const empTotals = {};
+  employees.forEach(e => empTotals[e.id] = 0);
+  let totalBruto = 0, totalIndivComm = 0, totalGlobalPool = 0;
+
+  workDays.forEach(day => {
+    const dr = getDayRevenue(day);
+    const globalBruto = parseFloat(dr.global) || 0;
+    const globalNet = globalBruto * (1 - TAX_RATE);
+    totalBruto += globalBruto;
+    totalGlobalPool += globalNet;
+
+    indivEmployees.forEach(emp => {
+      const sale = parseFloat((dr.individual||{})[emp.id]) || 0;
+      totalBruto += sale;
+      if (isAbsent(emp.id, day)) return;
+      const comm = sale * (1 - TAX_RATE) * INDIVIDUAL_RATE;
+      empTotals[emp.id] = (empTotals[emp.id]||0) + comm;
+      totalIndivComm += comm;
+    });
+
+    const g1Pool = globalNet * 0.73;
+    const g2Pool = globalNet * 0.27;
+    const g1Present = globalEmployees.filter(e => ["Salão","Bar","Caixa"].includes(e.sector) && !isAbsent(e.id,day));
+    const g2Present = globalEmployees.filter(e => ["Cozinha","Limpeza"].includes(e.sector) && !isAbsent(e.id,day));
+    const g1Pts = g1Present.reduce((s,e)=>s+e.points,0);
+    const g2Pts = g2Present.reduce((s,e)=>s+e.points,0);
+    g1Present.forEach(e => { if(g1Pts>0) empTotals[e.id]=(empTotals[e.id]||0)+(e.points/g1Pts)*g1Pool; });
+    g2Present.forEach(e => { if(g2Pts>0) empTotals[e.id]=(empTotals[e.id]||0)+(e.points/g2Pts)*g2Pool; });
   });
-  return { sales, absences };
+
+  return { empTotals, totalBruto, totalIndivComm, totalGlobalPool };
 }
 
 export default function App() {
+  const [authed, setAuthed] = useState(() => sessionStorage.getItem(SESSION_KEY) === "1");
+  if (!authed) return <LoginScreen onLogin={() => setAuthed(true)} />;
+  return <MainApp />;
+}
+
+function MainApp() {
+  const now = new Date();
+  const [month, setMonth] = useState(`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}`);
   const [employees, setEmployees] = useState(INITIAL_EMPLOYEES);
-  const [totalPool, setTotalPool] = useState("");
-  const [inputs, setInputs] = useState(() => initState(INITIAL_EMPLOYEES));
+  const [step, setStep] = useState("revenue");
   const [sector, setSector] = useState("Todos");
-  const [step, setStep] = useState("input"); // "input" | "results"
+  const [dailyRevenue, setDailyRevenue] = useState({});
+  const [absences, setAbsences] = useState({});
   const [showAdd, setShowAdd] = useState(false);
-  const [newEmp, setNewEmp] = useState({ name: "", role: "", sector: "Salão", type: "global", points: 15 });
-  const [month, setMonth] = useState(() => {
-    const now = new Date();
-    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-  });
+  const [newEmp, setNewEmp] = useState({ name:"", role:"", sector:"Salão", type:"individual", points:15 });
+  const [history, setHistory] = useState(loadHistory);
+  const [viewingHistory, setViewingHistory] = useState(null); // month key of history being viewed
+  const [showHistory, setShowHistory] = useState(false);
+  const printRef = useRef();
 
-  const results = useMemo(() => {
-    const pool = parseFloat(totalPool) || 0;
-    const netPool = pool * (1 - TAX_RATE);
+  const [year, mon] = month.split("-").map(Number);
+  const workDays = getWorkingDays(year, mon);
+  const monthLabel = new Date(year, mon-1, 2).toLocaleString("pt-BR",{month:"long",year:"numeric"});
 
-    // Garçons individual commission
-    const garcomSales = {};
-    let totalGarcomComm = 0;
-    employees.forEach((e) => {
-      if (e.type === "garcom") {
-        const sale = parseFloat(inputs.sales[e.id]) || 0;
-        const net = sale * (1 - TAX_RATE);
-        const comm = net * GARCOM_RATE;
-        garcomSales[e.id] = { sale, net, rawComm: comm };
-        totalGarcomComm += comm;
-      }
-    });
+  const getDayRevenue = (day) => dailyRevenue[day] || { global:"", individual:{} };
+  const setGlobalRevenue = (day, val) => setDailyRevenue(p=>({...p,[day]:{...getDayRevenue(day),global:val}}));
+  const setIndivRevenue = (day, empId, val) => setDailyRevenue(p=>({...p,[day]:{...getDayRevenue(day),individual:{...getDayRevenue(day).individual,[empId]:val}}}));
+  const toggleAbsence = (empId, day) => setAbsences(p=>({...p,[empId]:{...(p[empId]||{}),[day]:!(p[empId]||{})[day]}}));
+  const isAbsent = (empId, day) => !!(absences[empId]||{})[day];
+  const absenceCountByEmp = (empId) => workDays.filter(d=>isAbsent(empId,d)).length;
 
-    // Remaining for global pool
-    const globalPool = netPool - totalGarcomComm;
+  const indivEmployees = employees.filter(e=>e.type==="individual");
 
-    // Global pool: Grupo1 (Salão+Bar+Caixa) = 73%, Grupo2 (Cozinha+Limpeza) = 27%
-    const GRUPO1_PCT = 0.73;
-    const GRUPO2_PCT = 0.27;
+  const results = useMemo(() =>
+    calcResults(employees, workDays, dailyRevenue, absences, year, mon),
+    [dailyRevenue, absences, employees, month]
+  );
 
-    const grupo1Employees = employees.filter(
-      (e) => e.type === "global" && ["Salão", "Bar", "Caixa"].includes(e.sector)
-    );
-    const grupo2Employees = employees.filter(
-      (e) => e.type === "global" && ["Cozinha", "Limpeza"].includes(e.sector)
-    );
+  // Active data — either current or history view
+  const activeHistory = viewingHistory ? history.find(h=>h.monthKey===viewingHistory) : null;
+  const displayResults = activeHistory ? activeHistory.results : results;
+  const displayEmployees = activeHistory ? activeHistory.employees : employees;
+  const displayMonthLabel = activeHistory
+    ? new Date(activeHistory.year, activeHistory.mon-1, 2).toLocaleString("pt-BR",{month:"long",year:"numeric"})
+    : monthLabel;
 
-    const grupo1Pool = globalPool * GRUPO1_PCT;
-    const grupo2Pool = globalPool * GRUPO2_PCT;
+  const filteredEmps = sector==="Todos" ? displayEmployees : displayEmployees.filter(e=>e.sector===sector);
 
-    // Calculate effective points (deduct absences)
-    const getEffectivePoints = (emp) => {
-      const abs = parseInt(inputs.absences[emp.id]) || 0;
-      if (abs <= 0) return emp.points;
-      // Each absence deducts proportional share of their points
-      const daysInMonth = 26; // working days approx
-      const fraction = Math.max(0, 1 - abs / daysInMonth);
-      return emp.points * fraction;
+  // ── SAVE TO HISTORY ──
+  const handleSaveHistory = () => {
+    const monthKey = month;
+    const record = {
+      monthKey, year, mon, monthLabel,
+      savedAt: new Date().toISOString(),
+      employees,
+      results,
+      totalBruto: results.totalBruto,
     };
+    const updated = [record, ...history.filter(h=>h.monthKey!==monthKey)].slice(0, 24);
+    setHistory(updated);
+    saveHistory(updated);
+    alert(`Comissões de ${monthLabel} salvas com sucesso!`);
+  };
 
-    const calcGroupComm = (groupEmps, groupPool) => {
-      const totalPts = groupEmps.reduce((s, e) => s + getEffectivePoints(e), 0);
-      if (totalPts === 0) return {};
-      const perPoint = groupPool / totalPts;
-      const result = {};
-      groupEmps.forEach((e) => {
-        result[e.id] = getEffectivePoints(e) * perPoint;
-      });
-      return result;
-    };
+  // ── PDF PRINT ──
+  const handlePrint = () => {
+    const content = printRef.current;
+    const win = window.open("","_blank");
+    win.document.write(`
+      <html><head><title>Comissões ${displayMonthLabel} — Maguje</title>
+      <style>
+        * { box-sizing:border-box; margin:0; padding:0; }
+        body { font-family: Arial, sans-serif; font-size: 11px; color: #111; padding: 20px; }
+        h1 { font-size:16px; color:#1B4332; margin-bottom:4px; }
+        .sub { font-size:11px; color:#666; margin-bottom:16px; }
+        .summary { display:flex; gap:12px; margin-bottom:16px; flex-wrap:wrap; }
+        .sum-card { border:1px solid #ccc; border-radius:4px; padding:8px 14px; min-width:130px; }
+        .sum-val { font-size:14px; font-weight:700; color:#1B4332; }
+        .sum-lbl { font-size:9px; color:#888; text-transform:uppercase; letter-spacing:0.06em; margin-top:2px; }
+        table { width:100%; border-collapse:collapse; margin-bottom:20px; }
+        th { background:#1B4332; color:#fff; padding:7px 10px; text-align:left; font-size:10px; text-transform:uppercase; letter-spacing:0.05em; }
+        td { padding:6px 10px; border-bottom:1px solid #eee; font-size:11px; }
+        tr:nth-child(even) td { background:#fafaf8; }
+        .comm { font-weight:700; text-align:right; color:#1B4332; }
+        .sector-tag { font-size:9px; padding:1px 6px; border-radius:10px; display:inline-block; margin-top:2px; }
+        .absent { color:#c0392b; font-weight:600; }
+        tfoot td { background:#e8f0eb !important; font-weight:700; border-top:2px solid #1B4332; }
+        .section-hdr td { background:#1B433215 !important; font-weight:600; font-size:10px; text-transform:uppercase; letter-spacing:0.05em; color:#1B4332; }
+        @media print { body { padding:10px; } }
+      </style></head><body>
+      ${content.innerHTML}
+      </body></html>
+    `);
+    win.document.close();
+    setTimeout(()=>{ win.focus(); win.print(); }, 400);
+  };
 
-    const grupo1Comm = calcGroupComm(grupo1Employees, grupo1Pool);
-    const grupo2Comm = calcGroupComm(grupo2Employees, grupo2Pool);
-
-    const totals = {};
-    employees.forEach((e) => {
-      let comm = 0;
-      if (e.type === "garcom") {
-        const abs = parseInt(inputs.absences[e.id]) || 0;
-        const daysInMonth = 26;
-        const fraction = Math.max(0, 1 - abs / daysInMonth);
-        comm = (garcomSales[e.id]?.rawComm || 0) * fraction;
-      } else if (grupo1Comm[e.id] !== undefined) {
-        comm = grupo1Comm[e.id];
-      } else if (grupo2Comm[e.id] !== undefined) {
-        comm = grupo2Comm[e.id];
-      }
-      totals[e.id] = comm;
-    });
-
-    const g1TotalPts = grupo1Employees.reduce((s, e) => s + getEffectivePoints(e), 0);
-    const g2TotalPts = grupo2Employees.reduce((s, e) => s + getEffectivePoints(e), 0);
-    const g1PerPt = g1TotalPts > 0 ? grupo1Pool / g1TotalPts : 0;
-    const g2PerPt = g2TotalPts > 0 ? grupo2Pool / g2TotalPts : 0;
-
-    return {
-      pool,
-      netPool,
-      totalGarcomComm,
-      globalPool,
-      grupo1Pool,
-      grupo2Pool,
-      g1PerPt,
-      g2PerPt,
-      totals,
-      garcomSales,
-    };
-  }, [employees, totalPool, inputs]);
-
-  const filteredEmployees = sector === "Todos"
-    ? employees
-    : employees.filter((e) => e.sector === sector);
-
-  const handleAddEmployee = () => {
+  const addEmployee = () => {
     if (!newEmp.name.trim()) return;
     const id = Date.now();
-    setEmployees((prev) => [...prev, { ...newEmp, id, points: parseInt(newEmp.points) || 15 }]);
-    setInputs((prev) => ({
-      sales: { ...prev.sales, [id]: "" },
-      absences: { ...prev.absences, [id]: 0 },
-    }));
-    setNewEmp({ name: "", role: "", sector: "Salão", type: "global", points: 15 });
+    setEmployees(p=>[...p,{...newEmp,id,points:parseInt(newEmp.points)||15}]);
+    setNewEmp({name:"",role:"",sector:"Salão",type:"individual",points:15});
     setShowAdd(false);
   };
 
-  const handleRemoveEmployee = (id) => {
-    setEmployees((prev) => prev.filter((e) => e.id !== id));
+  // ── STYLES ──
+  const S = {
+    wrap: {fontFamily:"'DM Mono','Courier New',monospace",background:"#F5F0E8",minHeight:"100vh"},
+    header: {background:"#1B4332",padding:"16px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10},
+    card: {background:"#fff",border:"1.5px solid #D4CFC4",borderRadius:4,padding:"16px 20px"},
+    th: {padding:"9px 12px",textAlign:"left",fontSize:11,textTransform:"uppercase",letterSpacing:"0.06em",background:"#1B4332",color:"#fff",whiteSpace:"nowrap"},
+    td: {padding:"8px 12px",fontSize:13,borderBottom:"1px solid #eee",verticalAlign:"middle"},
+    input: {background:"#F5F0E8",border:"1px solid #ccc",borderRadius:3,padding:"5px 8px",fontFamily:"inherit",fontSize:12,width:"100%"},
+    btn: {border:"1.5px solid #1B4332",background:"#1B4332",color:"#fff",padding:"8px 18px",borderRadius:3,cursor:"pointer",fontFamily:"inherit",fontSize:13,fontWeight:500},
+    btnOut: {border:"1.5px solid #1B4332",background:"transparent",color:"#1B4332",padding:"8px 16px",borderRadius:3,cursor:"pointer",fontFamily:"inherit",fontSize:13},
+    btnGreen: {border:"1.5px solid #40916C",background:"#40916C",color:"#fff",padding:"8px 16px",borderRadius:3,cursor:"pointer",fontFamily:"inherit",fontSize:13},
+    tab: {padding:"6px 14px",border:"1px solid #ccc",borderRadius:20,cursor:"pointer",fontSize:12,background:"transparent",fontFamily:"inherit"},
+    tabActive: {padding:"6px 14px",border:"1px solid #1B4332",borderRadius:20,cursor:"pointer",fontSize:12,background:"#1B4332",color:"#fff",fontFamily:"inherit"},
+    stepBtn: (active) => ({padding:"8px 20px",border:"none",borderBottom:active?"2px solid #1B4332":"2px solid transparent",background:"transparent",cursor:"pointer",fontFamily:"inherit",fontSize:13,fontWeight:active?600:400,color:active?"#1B4332":"#888"}),
   };
 
-  const sectorColors = {
-    Salão: "#2D6A4F",
-    Bar: "#1B4332",
-    Caixa: "#40916C",
-    Cozinha: "#B5450B",
-    Limpeza: "#7B5EA7",
-  };
-
-  const [d] = month.split("-");
-  const monthLabel = new Date(month + "-02").toLocaleString("pt-BR", { month: "long", year: "numeric" });
-
-  return (
-    <div style={{ fontFamily: "'DM Mono', 'Courier New', monospace", background: "#F5F0E8", minHeight: "100vh", padding: "0" }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Space+Grotesk:wght@400;500;700&display=swap');
-        * { box-sizing: border-box; }
-        .card { background: #fff; border: 1.5px solid #1B4332; border-radius: 4px; }
-        input[type=number], input[type=text], select { 
-          background: #F5F0E8; border: 1px solid #ccc; border-radius: 3px;
-          padding: 6px 10px; font-family: inherit; font-size: 13px; width: 100%;
-          transition: border-color 0.15s;
-        }
-        input[type=number]:focus, input[type=text]:focus, select:focus {
-          outline: none; border-color: #2D6A4F;
-        }
-        .btn { 
-          border: 1.5px solid #1B4332; background: #1B4332; color: #fff;
-          padding: 8px 18px; border-radius: 3px; cursor: pointer; font-family: inherit;
-          font-size: 13px; font-weight: 500; transition: all 0.15s; letter-spacing: 0.02em;
-        }
-        .btn:hover { background: #2D6A4F; }
-        .btn-outline { background: transparent; color: #1B4332; }
-        .btn-outline:hover { background: #e8f0eb; }
-        .btn-danger { border-color: #c0392b; background: transparent; color: #c0392b; }
-        .btn-danger:hover { background: #fdf2f2; }
-        .tab { padding: 7px 16px; border: 1px solid #ccc; border-radius: 20px; cursor: pointer;
-          font-size: 12px; background: transparent; font-family: inherit; transition: all 0.15s; }
-        .tab.active { background: #1B4332; color: #fff; border-color: #1B4332; }
-        .tag { display: inline-block; font-size: 10px; padding: 2px 8px; border-radius: 20px; 
-          font-weight: 500; letter-spacing: 0.05em; text-transform: uppercase; }
-        .row-hover:hover { background: #f9f7f2; }
-        .metric { text-align: center; }
-        .metric-val { font-size: 22px; font-weight: 500; font-family: 'Space Grotesk', sans-serif; }
-        .metric-lbl { font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 0.08em; margin-top: 2px; }
-      `}</style>
-
-      {/* Header */}
-      <div style={{ background: "#1B4332", padding: "20px 28px", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
-        <div>
-          <div style={{ color: "#52B788", fontSize: 10, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 4 }}>Restaurante Maguje</div>
-          <div style={{ color: "#fff", fontSize: 22, fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700 }}>
-            Calculadora de Comissões
-          </div>
-          <div style={{ color: "#95D5B2", fontSize: 12, marginTop: 2, textTransform: "capitalize" }}>{monthLabel}</div>
+  // ── PRINT CONTENT ──
+  const PrintContent = ({ emps, res, label }) => {
+    const totalComm = emps.reduce((s,e)=>s+(res.empTotals[e.id]||0),0);
+    const sectors = ["Salão","Bar","Caixa","Cozinha","Limpeza"];
+    return (
+      <div>
+        <h1>Restaurante Maguje — Comissões</h1>
+        <div className="sub">Referência: {label} &nbsp;·&nbsp; Gerado em {new Date().toLocaleDateString("pt-BR")}</div>
+        <div className="summary">
+          {[
+            {label:"Total Bruto", val:fmt(res.totalBruto)},
+            {label:"Desconto 33%", val:fmt(res.totalBruto*TAX_RATE)},
+            {label:"Pool Global Líq.", val:fmt(res.totalGlobalPool)},
+            {label:"Comissões Indiv.", val:fmt(res.totalIndivComm)},
+            {label:"Total Distribuído", val:fmt(totalComm)},
+          ].map(m=>(
+            <div key={m.label} className="sum-card">
+              <div className="sum-val">{m.val}</div>
+              <div className="sum-lbl">{m.label}</div>
+            </div>
+          ))}
         </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button className="btn btn-outline" style={{ color: "#95D5B2", borderColor: "#52B788" }}
-            onClick={() => setStep(step === "input" ? "results" : "input")}>
-            {step === "input" ? "Ver Resultado →" : "← Editar Dados"}
-          </button>
-        </div>
-      </div>
-
-      {step === "input" && (
-        <div style={{ padding: "20px 28px" }}>
-          {/* Month + Pool config */}
-          <div className="card" style={{ padding: "18px 20px", marginBottom: 20 }}>
-            <div style={{ fontSize: 11, color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 14 }}>Configuração do Mês</div>
-            <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
-              <div style={{ flex: 1, minWidth: 160 }}>
-                <div style={{ fontSize: 11, color: "#555", marginBottom: 5 }}>Mês de referência</div>
-                <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} style={{ background: "#F5F0E8", border: "1px solid #ccc", borderRadius: 3, padding: "7px 10px", fontFamily: "inherit", fontSize: 13, width: "100%" }} />
-              </div>
-              <div style={{ flex: 1, minWidth: 220 }}>
-                <div style={{ fontSize: 11, color: "#555", marginBottom: 5 }}>Gorjeta Total Bruta (pool geral — equipe não-garçons)</div>
-                <input type="number" placeholder="Ex: 53152.69" value={totalPool}
-                  onChange={(e) => setTotalPool(e.target.value)}
-                  style={{ background: "#F5F0E8", border: "1px solid #ccc", borderRadius: 3, padding: "7px 10px", fontFamily: "inherit", fontSize: 13, width: "100%" }} />
-              </div>
-            </div>
-            {totalPool && (
-              <div style={{ marginTop: 14, display: "flex", gap: 24, flexWrap: "wrap" }}>
-                <div className="metric"><div className="metric-val" style={{ color: "#1B4332" }}>{fmt(parseFloat(totalPool) || 0)}</div><div className="metric-lbl">Bruto Total</div></div>
-                <div className="metric"><div className="metric-val" style={{ color: "#40916C" }}>{fmt(results.netPool)}</div><div className="metric-lbl">Líquido (−33%)</div></div>
-                <div className="metric"><div className="metric-val" style={{ color: "#52B788" }}>{fmt(results.grupo1Pool)}</div><div className="metric-lbl">Pool Salão/Bar/Cx (73%)</div></div>
-                <div className="metric"><div className="metric-val" style={{ color: "#B5450B" }}>{fmt(results.grupo2Pool)}</div><div className="metric-lbl">Pool Cozinha/Limp. (27%)</div></div>
-              </div>
-            )}
-          </div>
-
-          {/* Sector filter */}
-          <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
-            {SECTORS.map((s) => (
-              <button key={s} className={`tab${sector === s ? " active" : ""}`} onClick={() => setSector(s)}>{s}</button>
-            ))}
-            <div style={{ marginLeft: "auto" }}>
-              <button className="btn" style={{ fontSize: 12, padding: "6px 14px" }} onClick={() => setShowAdd(!showAdd)}>
-                {showAdd ? "✕ Cancelar" : "+ Funcionário"}
-              </button>
-            </div>
-          </div>
-
-          {/* Add employee form */}
-          {showAdd && (
-            <div className="card" style={{ padding: "16px 20px", marginBottom: 16, borderColor: "#52B788" }}>
-              <div style={{ fontSize: 11, color: "#1B4332", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 12 }}>Novo Funcionário</div>
-              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                <div style={{ flex: 2, minWidth: 160 }}>
-                  <div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>Nome</div>
-                  <input type="text" placeholder="Nome completo" value={newEmp.name} onChange={(e) => setNewEmp((p) => ({ ...p, name: e.target.value }))} />
-                </div>
-                <div style={{ flex: 1, minWidth: 120 }}>
-                  <div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>Cargo</div>
-                  <input type="text" placeholder="Cargo" value={newEmp.role} onChange={(e) => setNewEmp((p) => ({ ...p, role: e.target.value }))} />
-                </div>
-                <div style={{ flex: 1, minWidth: 100 }}>
-                  <div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>Setor</div>
-                  <select value={newEmp.sector} onChange={(e) => setNewEmp((p) => ({ ...p, sector: e.target.value }))}>
-                    {["Salão", "Bar", "Caixa", "Cozinha", "Limpeza"].map((s) => <option key={s}>{s}</option>)}
-                  </select>
-                </div>
-                <div style={{ flex: 1, minWidth: 110 }}>
-                  <div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>Tipo</div>
-                  <select value={newEmp.type} onChange={(e) => setNewEmp((p) => ({ ...p, type: e.target.value }))}>
-                    <option value="global">Equipe Global</option>
-                    <option value="garcom">Garçom (individual)</option>
-                  </select>
-                </div>
-                {newEmp.type === "global" && (
-                  <div style={{ flex: 1, minWidth: 80 }}>
-                    <div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>Pontos</div>
-                    <input type="number" min="1" max="50" value={newEmp.points} onChange={(e) => setNewEmp((p) => ({ ...p, points: e.target.value }))} />
-                  </div>
-                )}
-                <div style={{ display: "flex", alignItems: "flex-end" }}>
-                  <button className="btn" onClick={handleAddEmployee}>Adicionar</button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Employee table */}
-          <div className="card" style={{ overflow: "hidden" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        {sectors.map(sec => {
+          const secEmps = emps.filter(e=>e.sector===sec);
+          if (!secEmps.length) return null;
+          const secTotal = secEmps.reduce((s,e)=>s+(res.empTotals[e.id]||0),0);
+          return (
+            <table key={sec}>
               <thead>
-                <tr style={{ background: "#1B4332", color: "#fff" }}>
-                  <th style={{ padding: "10px 14px", textAlign: "left", fontSize: 11, letterSpacing: "0.06em", textTransform: "uppercase" }}>Funcionário</th>
-                  <th style={{ padding: "10px 14px", textAlign: "left", fontSize: 11, letterSpacing: "0.06em", textTransform: "uppercase" }}>Cargo / Pontos</th>
-                  <th style={{ padding: "10px 14px", textAlign: "left", fontSize: 11, letterSpacing: "0.06em", textTransform: "uppercase", minWidth: 150 }}>Venda (Garçons)</th>
-                  <th style={{ padding: "10px 14px", textAlign: "center", fontSize: 11, letterSpacing: "0.06em", textTransform: "uppercase", minWidth: 80 }}>Faltas</th>
-                  <th style={{ padding: "10px 6px", width: 36 }}></th>
+                <tr><th colSpan={5} style={{background:"#2D6A4F"}}>{sec}</th></tr>
+                <tr>
+                  <th>Funcionário</th><th>Cargo</th><th>Tipo</th><th style={{textAlign:"center"}}>Faltas</th><th style={{textAlign:"right"}}>Comissão</th>
                 </tr>
               </thead>
               <tbody>
-                {filteredEmployees.map((emp, idx) => {
-                  const color = sectorColors[emp.sector] || "#555";
+                {secEmps.sort((a,b)=>(res.empTotals[b.id]||0)-(res.empTotals[a.id]||0)).map(emp=>{
+                  const abs = workDays.filter(d=>isAbsent(emp.id,d)).length;
                   return (
-                    <tr key={emp.id} className="row-hover" style={{ borderBottom: "1px solid #eee", background: idx % 2 === 0 ? "#fff" : "#fafaf8" }}>
-                      <td style={{ padding: "10px 14px" }}>
-                        <div style={{ fontSize: 13, fontWeight: 500 }}>{emp.name}</div>
-                        <span className="tag" style={{ background: color + "18", color, border: `1px solid ${color}40`, marginTop: 3 }}>
-                          {emp.sector}
-                        </span>
-                      </td>
-                      <td style={{ padding: "10px 14px" }}>
-                        <div style={{ fontSize: 12, color: "#444" }}>{emp.role}</div>
-                        {emp.type === "global" ? (
-                          <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>{emp.points} pts</div>
-                        ) : (
-                          <div style={{ fontSize: 11, color: "#B5450B", marginTop: 2 }}>29% da venda</div>
-                        )}
-                      </td>
-                      <td style={{ padding: "8px 14px" }}>
-                        {emp.type === "garcom" ? (
-                          <input type="number" min="0" placeholder="R$ 0,00"
-                            value={inputs.sales[emp.id]}
-                            onChange={(e) => setInputs((p) => ({ ...p, sales: { ...p.sales, [emp.id]: e.target.value } }))}
-                          />
-                        ) : (
-                          <span style={{ fontSize: 12, color: "#aaa" }}>—</span>
-                        )}
-                      </td>
-                      <td style={{ padding: "8px 14px", textAlign: "center" }}>
-                        <input type="number" min="0" max="31"
-                          value={inputs.absences[emp.id]}
-                          onChange={(e) => setInputs((p) => ({ ...p, absences: { ...p.absences, [emp.id]: e.target.value } }))}
-                          style={{ width: 60, textAlign: "center" }}
-                        />
-                      </td>
-                      <td style={{ padding: "8px 6px", textAlign: "center" }}>
-                        <button className="btn btn-danger" style={{ padding: "3px 8px", fontSize: 11, border: "none", background: "transparent", color: "#ccc", cursor: "pointer" }}
-                          onClick={() => handleRemoveEmployee(emp.id)} title="Remover">✕</button>
-                      </td>
+                    <tr key={emp.id}>
+                      <td>{emp.name}</td>
+                      <td>{emp.role}</td>
+                      <td>{emp.type==="individual"?"Individual (29%)":"Global ("+emp.points+"pts)"}</td>
+                      <td style={{textAlign:"center"}}>{abs>0?<span className="absent">{abs} dia{abs>1?"s":""}</span>:"—"}</td>
+                      <td className="comm">{fmt(res.empTotals[emp.id]||0)}</td>
                     </tr>
                   );
                 })}
               </tbody>
+              <tfoot>
+                <tr><td colSpan={4}>Total {sec}</td><td className="comm">{fmt(secTotal)}</td></tr>
+              </tfoot>
             </table>
-          </div>
+          );
+        })}
+        <table>
+          <tfoot>
+            <tr style={{background:"#1B4332",color:"#fff"}}>
+              <td colSpan={4} style={{fontWeight:700,fontSize:13}}>TOTAL GERAL</td>
+              <td style={{fontWeight:700,fontSize:14,textAlign:"right"}}>{fmt(totalComm)}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    );
+  };
 
-          <div style={{ marginTop: 20, textAlign: "right" }}>
-            <button className="btn" style={{ fontSize: 14, padding: "10px 28px" }} onClick={() => setStep("results")}>
-              Calcular Comissões →
-            </button>
+  return (
+    <div style={S.wrap}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Space+Grotesk:wght@500;700&display=swap');
+        * { box-sizing: border-box; }
+        input:focus { outline: none; border-color: #2D6A4F !important; }
+        .absent-btn { width:28px; height:28px; border-radius:4px; border:1.5px solid #ddd; background:#fff; cursor:pointer; font-size:12px; display:flex; align-items:center; justify-content:center; transition:all 0.1s; }
+        .absent-btn.marked { background:#c0392b; border-color:#c0392b; color:#fff; }
+        .absent-btn:hover { border-color:#c0392b; }
+        .row-hover:hover td { background:#fafaf7 !important; }
+        ::-webkit-scrollbar { height:5px; width:5px; } ::-webkit-scrollbar-thumb { background:#ccc; border-radius:3px; }
+        .print-hidden { display:none; }
+      `}</style>
+
+      {/* Hidden print area */}
+      <div ref={printRef} className="print-hidden">
+        <PrintContent emps={displayEmployees} res={displayResults} label={displayMonthLabel} />
+      </div>
+
+      {/* Header */}
+      <div style={S.header}>
+        <div>
+          <div style={{color:"#52B788",fontSize:10,letterSpacing:"0.15em",textTransform:"uppercase",marginBottom:3}}>Restaurante Maguje</div>
+          <div style={{color:"#fff",fontSize:20,fontFamily:"'Space Grotesk',sans-serif",fontWeight:700}}>Calculadora de Comissões</div>
+          <div style={{color:"#95D5B2",fontSize:12,marginTop:2,textTransform:"capitalize"}}>{monthLabel}</div>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+          <input type="month" value={month} onChange={e=>{setMonth(e.target.value);setViewingHistory(null);}}
+            style={{...S.input,width:150,background:"#2D6A4F",color:"#fff",border:"1px solid #52B788",colorScheme:"dark"}} />
+          <button style={{...S.btnOut,color:"#95D5B2",borderColor:"#52B788",fontSize:12,padding:"7px 14px"}}
+            onClick={()=>setShowHistory(!showHistory)}>
+            🗂 Histórico {history.length>0&&`(${history.length})`}
+          </button>
+          <button style={{...S.btnOut,color:"#f28b82",borderColor:"#f28b82",fontSize:12,padding:"7px 14px"}}
+            onClick={()=>{ sessionStorage.removeItem(SESSION_KEY); window.location.reload(); }}>
+            Sair
+          </button>
+        </div>
+      </div>
+
+      {/* History panel */}
+      {showHistory && (
+        <div style={{background:"#fff",borderBottom:"1px solid #D4CFC4",padding:"16px 24px"}}>
+          <div style={{fontSize:11,color:"#666",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:12}}>
+            Histórico de Comissões Salvas
           </div>
+          {history.length === 0 ? (
+            <div style={{fontSize:13,color:"#aaa"}}>Nenhum mês salvo ainda. Calcule e salve o resultado de um mês.</div>
+          ) : (
+            <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+              {history.map(h => (
+                <div key={h.monthKey}
+                  onClick={()=>{setViewingHistory(h.monthKey===viewingHistory?null:h.monthKey);setStep("results");setShowHistory(false);}}
+                  style={{border:`1.5px solid ${viewingHistory===h.monthKey?"#1B4332":"#D4CFC4"}`,borderRadius:4,padding:"10px 16px",cursor:"pointer",
+                    background:viewingHistory===h.monthKey?"#1B4332":"#fff",color:viewingHistory===h.monthKey?"#fff":"#333",
+                    minWidth:140,transition:"all 0.15s"}}>
+                  <div style={{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,fontSize:13,textTransform:"capitalize"}}>{h.monthLabel}</div>
+                  <div style={{fontSize:11,marginTop:3,opacity:0.7}}>Total: {fmt(h.totalBruto)}</div>
+                  <div style={{fontSize:10,marginTop:2,opacity:0.5}}>Salvo em {new Date(h.savedAt).toLocaleDateString("pt-BR")}</div>
+                </div>
+              ))}
+            </div>
+          )}
+          {viewingHistory && (
+            <div style={{marginTop:12,padding:"10px 14px",background:"#fff8e6",border:"1px solid #f0c040",borderRadius:4,fontSize:12,color:"#7a5c00"}}>
+              Você está vendo o histórico de <strong style={{textTransform:"capitalize"}}>{displayMonthLabel}</strong>.{" "}
+              <span style={{cursor:"pointer",textDecoration:"underline"}} onClick={()=>setViewingHistory(null)}>Voltar ao mês atual</span>
+            </div>
+          )}
         </div>
       )}
 
-      {step === "results" && (
-        <div style={{ padding: "20px 28px" }}>
-          {/* Summary cards */}
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px,1fr))", gap: 12, marginBottom: 24 }}>
-            {[
-              { label: "Total Bruto", val: results.pool, color: "#1B4332" },
-              { label: "Desconto 33%", val: results.pool - results.netPool, color: "#c0392b" },
-              { label: "Total Líquido", val: results.netPool, color: "#2D6A4F" },
-              { label: "Pool Salão/Bar/Cx", val: results.grupo1Pool, color: "#40916C" },
-              { label: "Pool Cozinha/Limp.", val: results.grupo2Pool, color: "#B5450B" },
-              { label: "Garçons (individual)", val: results.totalGarcomComm, color: "#7B5EA7" },
-            ].map((m) => (
-              <div key={m.label} className="card" style={{ padding: "14px 16px", textAlign: "center" }}>
-                <div style={{ fontSize: 18, fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, color: m.color }}>{fmt(m.val)}</div>
-                <div style={{ fontSize: 10, color: "#888", textTransform: "uppercase", letterSpacing: "0.07em", marginTop: 3 }}>{m.label}</div>
+      {/* Step tabs */}
+      {!viewingHistory && (
+        <div style={{background:"#fff",borderBottom:"1px solid #e0dbd0",padding:"0 24px",display:"flex",gap:0}}>
+          {[["revenue","1. Faturamento Diário"],["absences","2. Faltas por Dia"],["results","3. Resultado"]].map(([key,label])=>(
+            <button key={key} style={S.stepBtn(step===key)} onClick={()=>setStep(key)}>{label}</button>
+          ))}
+        </div>
+      )}
+
+      <div style={{padding:"20px 24px"}}>
+
+        {/* ── HISTORY VIEW ── */}
+        {viewingHistory && (
+          <>
+            <div style={{...S.card,marginBottom:16,borderColor:"#f0c040",background:"#fffdf0"}}>
+              <div style={{fontSize:12,color:"#7a5c00"}}>
+                📋 Visualizando histórico de <strong style={{textTransform:"capitalize"}}>{displayMonthLabel}</strong>
+                {" · "}
+                <span style={{cursor:"pointer",textDecoration:"underline"}} onClick={()=>setViewingHistory(null)}>Voltar ao mês atual</span>
               </div>
-            ))}
-          </div>
+            </div>
+            <ResultsTable emps={displayEmployees} res={displayResults} sector={sector} setSector={setSector}
+              S={S} SECTORS={SECTORS} SECTOR_COLORS={SECTOR_COLORS} fmt={fmt}
+              onPrint={handlePrint} onSave={null} showSave={false}
+              absCountFn={()=>0} />
+          </>
+        )}
 
-          {/* Sector filter */}
-          <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
-            {SECTORS.map((s) => (
-              <button key={s} className={`tab${sector === s ? " active" : ""}`} onClick={() => setSector(s)}>{s}</button>
-            ))}
-          </div>
-
-          {/* Results table */}
-          <div className="card" style={{ overflow: "hidden" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse" }}>
-              <thead>
-                <tr style={{ background: "#1B4332", color: "#fff" }}>
-                  <th style={{ padding: "10px 14px", textAlign: "left", fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em" }}>Funcionário</th>
-                  <th style={{ padding: "10px 14px", textAlign: "left", fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em" }}>Cargo</th>
-                  <th style={{ padding: "10px 14px", textAlign: "center", fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em" }}>Tipo</th>
-                  <th style={{ padding: "10px 14px", textAlign: "center", fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em" }}>Pts / Venda</th>
-                  <th style={{ padding: "10px 14px", textAlign: "center", fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em" }}>Faltas</th>
-                  <th style={{ padding: "10px 14px", textAlign: "right", fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em" }}>Comissão</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredEmployees
-                  .slice()
-                  .sort((a, b) => (results.totals[b.id] || 0) - (results.totals[a.id] || 0))
-                  .map((emp, idx) => {
-                    const comm = results.totals[emp.id] || 0;
-                    const color = sectorColors[emp.sector] || "#555";
-                    const abs = parseInt(inputs.absences[emp.id]) || 0;
+        {/* ── STEP 1: REVENUE ── */}
+        {!viewingHistory && step==="revenue" && (
+          <>
+            <div style={{...S.card,marginBottom:16}}>
+              <div style={{fontSize:11,color:"#666",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Como funciona</div>
+              <div style={{fontSize:12,color:"#555",lineHeight:1.7}}>
+                Insira a venda de cada garçom/chefe de fila por dia, e o faturamento global do dia (sem comissão individual). O desconto de 33% é aplicado automaticamente.
+              </div>
+            </div>
+            <div style={{overflowX:"auto"}}>
+              <table style={{borderCollapse:"collapse",width:"100%",minWidth:200+workDays.length*60}}>
+                <thead>
+                  <tr>
+                    <th style={{...S.th,position:"sticky",left:0,zIndex:2,minWidth:200}}>Funcionário</th>
+                    {workDays.map(d=>{
+                      const dow=new Date(year,mon-1,d).getDay();
+                      return <th key={d} style={{...S.th,textAlign:"center",minWidth:60}}>
+                        <div>{d}</div><div style={{fontWeight:300,fontSize:9,opacity:0.7}}>{DOW_LABELS[dow]}</div>
+                      </th>;
+                    })}
+                    <th style={{...S.th,textAlign:"right",minWidth:110}}>Total Bruto</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr><td colSpan={workDays.length+2} style={{...S.td,background:"#1B433210",fontWeight:600,fontSize:11,textTransform:"uppercase",letterSpacing:"0.06em",color:"#1B4332",padding:"10px 12px"}}>
+                    Venda Individual — Garçons e Chefes de Fila Junior (29%)
+                  </td></tr>
+                  {indivEmployees.map((emp,idx)=>{
+                    const total=workDays.reduce((s,d)=>s+(parseFloat(getDayRevenue(d).individual[emp.id])||0),0);
                     return (
-                      <tr key={emp.id} className="row-hover" style={{ borderBottom: "1px solid #eee", background: idx % 2 === 0 ? "#fff" : "#fafaf8" }}>
-                        <td style={{ padding: "10px 14px" }}>
-                          <div style={{ fontSize: 13, fontWeight: 500 }}>{emp.name}</div>
-                          <span className="tag" style={{ background: color + "18", color, border: `1px solid ${color}40`, marginTop: 3 }}>
-                            {emp.sector}
-                          </span>
+                      <tr key={emp.id} className="row-hover">
+                        <td style={{...S.td,position:"sticky",left:0,background:idx%2===0?"#fff":"#fafaf8",zIndex:1,fontWeight:500}}>
+                          <div style={{fontSize:12}}>{emp.name}</div>
+                          <div style={{fontSize:10,color:SECTOR_COLORS[emp.sector]||"#888",marginTop:1}}>{emp.role}</div>
                         </td>
-                        <td style={{ padding: "10px 14px", fontSize: 12, color: "#444" }}>{emp.role}</td>
-                        <td style={{ padding: "10px 14px", textAlign: "center" }}>
-                          {emp.type === "garcom"
-                            ? <span className="tag" style={{ background: "#7B5EA720", color: "#7B5EA7", border: "1px solid #7B5EA740" }}>Individual</span>
-                            : <span className="tag" style={{ background: "#2D6A4F20", color: "#2D6A4F", border: "1px solid #2D6A4F40" }}>Global</span>}
-                        </td>
-                        <td style={{ padding: "10px 14px", textAlign: "center", fontSize: 12, color: "#555" }}>
-                          {emp.type === "garcom"
-                            ? fmt(parseFloat(inputs.sales[emp.id]) || 0)
-                            : `${emp.points} pts`}
-                        </td>
-                        <td style={{ padding: "10px 14px", textAlign: "center" }}>
-                          {abs > 0
-                            ? <span style={{ background: "#fdecea", color: "#c0392b", borderRadius: 10, padding: "2px 8px", fontSize: 12 }}>{abs} falta{abs > 1 ? "s" : ""}</span>
-                            : <span style={{ color: "#aaa", fontSize: 12 }}>—</span>}
-                        </td>
-                        <td style={{ padding: "10px 14px", textAlign: "right" }}>
-                          <span style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: 15, color: comm > 0 ? "#1B4332" : "#bbb" }}>
-                            {fmt(comm)}
-                          </span>
+                        {workDays.map(d=>(
+                          <td key={d} style={{...S.td,padding:"5px 6px",background:idx%2===0?"#fff":"#fafaf8"}}>
+                            <input type="number" min="0" placeholder="0"
+                              value={getDayRevenue(d).individual[emp.id]||""}
+                              onChange={e=>setIndivRevenue(d,emp.id,e.target.value)}
+                              style={{...S.input,width:52,textAlign:"right",padding:"4px 5px"}} />
+                          </td>
+                        ))}
+                        <td style={{...S.td,textAlign:"right",fontFamily:"'Space Grotesk',sans-serif",fontWeight:600,color:"#1B4332",background:idx%2===0?"#fff":"#fafaf8"}}>
+                          {fmt(total)}
                         </td>
                       </tr>
                     );
                   })}
-              </tbody>
-              <tfoot>
-                <tr style={{ background: "#f0f5f0", borderTop: "2px solid #1B4332" }}>
-                  <td colSpan={5} style={{ padding: "12px 14px", fontSize: 13, fontWeight: 600, color: "#1B4332" }}>
-                    Total {sector !== "Todos" ? `— ${sector}` : ""}
-                  </td>
-                  <td style={{ padding: "12px 14px", textAlign: "right" }}>
-                    <span style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: 17, color: "#1B4332" }}>
-                      {fmt(filteredEmployees.reduce((s, e) => s + (results.totals[e.id] || 0), 0))}
-                    </span>
-                  </td>
-                </tr>
-              </tfoot>
-            </table>
-          </div>
-
-          {/* Point value reference */}
-          <div style={{ marginTop: 20, display: "flex", gap: 12, flexWrap: "wrap" }}>
-            <div className="card" style={{ padding: "12px 18px", flex: 1, minWidth: 200 }}>
-              <div style={{ fontSize: 10, color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 6 }}>Valor do Ponto — Salão / Bar / Caixa</div>
-              <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 20, fontWeight: 700, color: "#2D6A4F" }}>{fmt(results.g1PerPt)}</div>
-              <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>por ponto</div>
+                  <tr><td colSpan={workDays.length+2} style={{...S.td,background:"#40916C18",fontWeight:600,fontSize:11,textTransform:"uppercase",letterSpacing:"0.06em",color:"#40916C",padding:"10px 12px"}}>
+                    Faturamento Global do Dia (distribuído por pontos)
+                  </td></tr>
+                  <tr className="row-hover">
+                    <td style={{...S.td,position:"sticky",left:0,background:"#fff",zIndex:1,fontWeight:500}}>
+                      <div style={{fontSize:12}}>Vendas sem comissão individual</div>
+                    </td>
+                    {workDays.map(d=>(
+                      <td key={d} style={{...S.td,padding:"5px 6px",background:"#fff"}}>
+                        <input type="number" min="0" placeholder="0"
+                          value={getDayRevenue(d).global||""}
+                          onChange={e=>setGlobalRevenue(d,e.target.value)}
+                          style={{...S.input,width:52,textAlign:"right",padding:"4px 5px",borderColor:"#40916C60"}} />
+                      </td>
+                    ))}
+                    <td style={{...S.td,textAlign:"right",fontFamily:"'Space Grotesk',sans-serif",fontWeight:600,color:"#40916C"}}>
+                      {fmt(workDays.reduce((s,d)=>s+(parseFloat(getDayRevenue(d).global)||0),0))}
+                    </td>
+                  </tr>
+                  <tr style={{background:"#F5F0E8"}}>
+                    <td style={{...S.td,position:"sticky",left:0,background:"#F5F0E8",zIndex:1,fontWeight:600,fontSize:11,textTransform:"uppercase",letterSpacing:"0.05em"}}>Total do Dia</td>
+                    {workDays.map(d=>{
+                      const dr=getDayRevenue(d);
+                      const tot=indivEmployees.reduce((s,e)=>s+(parseFloat(dr.individual[e.id])||0),0)+(parseFloat(dr.global)||0);
+                      return <td key={d} style={{...S.td,textAlign:"right",fontWeight:600,fontSize:11,background:"#F5F0E8",padding:"7px 5px",color:"#1B4332"}}>
+                        {tot>0?fmtShort(tot):"—"}
+                      </td>;
+                    })}
+                    <td style={{...S.td,textAlign:"right",fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,color:"#1B4332",background:"#F5F0E8"}}>
+                      {fmt(workDays.reduce((s,d)=>{
+                        const dr=getDayRevenue(d);
+                        return s+indivEmployees.reduce((ss,e)=>ss+(parseFloat(dr.individual[e.id])||0),0)+(parseFloat(dr.global)||0);
+                      },0))}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
-            <div className="card" style={{ padding: "12px 18px", flex: 1, minWidth: 200 }}>
-              <div style={{ fontSize: 10, color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 6 }}>Valor do Ponto — Cozinha / Limpeza</div>
-              <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 20, fontWeight: 700, color: "#B5450B" }}>{fmt(results.g2PerPt)}</div>
-              <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>por ponto</div>
+            <div style={{marginTop:20,textAlign:"right"}}>
+              <button style={S.btn} onClick={()=>setStep("absences")}>Próximo: Faltas →</button>
             </div>
-          </div>
+          </>
+        )}
 
-          <div style={{ marginTop: 20, textAlign: "right" }}>
-            <button className="btn btn-outline" onClick={() => setStep("input")}>← Voltar e Editar</button>
-          </div>
-        </div>
-      )}
+        {/* ── STEP 2: ABSENCES ── */}
+        {!viewingHistory && step==="absences" && (
+          <>
+            <div style={{...S.card,marginBottom:16}}>
+              <div style={{fontSize:11,color:"#666",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Faltas por Dia</div>
+              <div style={{fontSize:12,color:"#555",lineHeight:1.7}}>
+                Clique no botão do dia para marcar <strong>F</strong> (falta). O funcionário perde a comissão daquele dia — individual e global.
+              </div>
+            </div>
+            <div style={{display:"flex",gap:6,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
+              {SECTORS.map(s2=>(
+                <button key={s2} style={sector===s2?S.tabActive:S.tab} onClick={()=>setSector(s2)}>{s2}</button>
+              ))}
+              <div style={{marginLeft:"auto"}}>
+                <button style={{...S.btnOut,fontSize:12,padding:"6px 14px"}} onClick={()=>setShowAdd(!showAdd)}>
+                  {showAdd?"✕ Cancelar":"+ Funcionário"}
+                </button>
+              </div>
+            </div>
+            {showAdd && (
+              <div style={{...S.card,marginBottom:16,borderColor:"#52B788"}}>
+                <div style={{fontSize:11,color:"#1B4332",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:12}}>Novo Funcionário</div>
+                <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+                  <div style={{flex:2,minWidth:150}}><div style={{fontSize:11,color:"#555",marginBottom:4}}>Nome</div>
+                    <input type="text" value={newEmp.name} onChange={e=>setNewEmp(p=>({...p,name:e.target.value}))} placeholder="Nome completo" style={S.input}/></div>
+                  <div style={{flex:1,minWidth:120}}><div style={{fontSize:11,color:"#555",marginBottom:4}}>Cargo</div>
+                    <input type="text" value={newEmp.role} onChange={e=>setNewEmp(p=>({...p,role:e.target.value}))} placeholder="Cargo" style={S.input}/></div>
+                  <div style={{flex:1,minWidth:100}}><div style={{fontSize:11,color:"#555",marginBottom:4}}>Setor</div>
+                    <select value={newEmp.sector} onChange={e=>setNewEmp(p=>({...p,sector:e.target.value}))} style={S.input}>
+                      {["Salão","Bar","Caixa","Cozinha","Limpeza"].map(x=><option key={x}>{x}</option>)}
+                    </select></div>
+                  <div style={{flex:1,minWidth:110}}><div style={{fontSize:11,color:"#555",marginBottom:4}}>Tipo</div>
+                    <select value={newEmp.type} onChange={e=>setNewEmp(p=>({...p,type:e.target.value}))} style={S.input}>
+                      <option value="individual">Individual (Garçom/Chefe)</option>
+                      <option value="global">Global (Pool por pontos)</option>
+                    </select></div>
+                  {newEmp.type==="global"&&<div style={{flex:1,minWidth:80}}><div style={{fontSize:11,color:"#555",marginBottom:4}}>Pontos</div>
+                    <input type="number" min="1" max="50" value={newEmp.points} onChange={e=>setNewEmp(p=>({...p,points:e.target.value}))} style={S.input}/></div>}
+                  <div style={{display:"flex",alignItems:"flex-end"}}>
+                    <button style={S.btn} onClick={addEmployee}>Adicionar</button>
+                  </div>
+                </div>
+              </div>
+            )}
+            <div style={{overflowX:"auto"}}>
+              <table style={{borderCollapse:"collapse",width:"100%",minWidth:220+workDays.length*42}}>
+                <thead>
+                  <tr>
+                    <th style={{...S.th,position:"sticky",left:0,zIndex:2,minWidth:220}}>Funcionário</th>
+                    {workDays.map(d=>{
+                      const dow=new Date(year,mon-1,d).getDay();
+                      return <th key={d} style={{...S.th,textAlign:"center",minWidth:42,padding:"8px 4px"}}>
+                        <div>{d}</div><div style={{fontWeight:300,fontSize:9,opacity:0.7}}>{DOW_LABELS[dow]}</div>
+                      </th>;
+                    })}
+                    <th style={{...S.th,textAlign:"center",minWidth:70}}>Faltas</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[
+                    {label:"Garçons e Chefes de Fila Junior",emps:filteredEmps.filter(e=>e.type==="individual")},
+                    {label:"Equipe Global",emps:filteredEmps.filter(e=>e.type==="global")},
+                  ].map(group=>group.emps.length===0?null:(
+                    <>
+                      <tr key={group.label}><td colSpan={workDays.length+2} style={{...S.td,background:"#1B433210",fontWeight:600,fontSize:11,textTransform:"uppercase",letterSpacing:"0.06em",color:"#1B4332",padding:"10px 12px"}}>{group.label}</td></tr>
+                      {group.emps.map((emp,idx)=>{
+                        const absCount=absenceCountByEmp(emp.id);
+                        return (
+                          <tr key={emp.id} className="row-hover">
+                            <td style={{...S.td,position:"sticky",left:0,background:idx%2===0?"#fff":"#fafaf8",zIndex:1}}>
+                              <div style={{fontSize:12,fontWeight:500}}>{emp.name}</div>
+                              <div style={{fontSize:10,color:SECTOR_COLORS[emp.sector]||"#888",marginTop:1}}>{emp.role} · {emp.sector}</div>
+                            </td>
+                            {workDays.map(d=>{
+                              const absent=isAbsent(emp.id,d);
+                              return (
+                                <td key={d} style={{...S.td,textAlign:"center",padding:"5px 4px",background:absent?"#fdecea":idx%2===0?"#fff":"#fafaf8"}}>
+                                  <button className={`absent-btn${absent?" marked":""}`} onClick={()=>toggleAbsence(emp.id,d)}>{absent?"F":"·"}</button>
+                                </td>
+                              );
+                            })}
+                            <td style={{...S.td,textAlign:"center",background:idx%2===0?"#fff":"#fafaf8"}}>
+                              {absCount>0?<span style={{background:"#fdecea",color:"#c0392b",borderRadius:10,padding:"2px 8px",fontSize:12,fontWeight:600}}>{absCount}</span>:<span style={{color:"#ccc",fontSize:12}}>—</span>}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div style={{marginTop:20,display:"flex",justifyContent:"space-between"}}>
+              <button style={S.btnOut} onClick={()=>setStep("revenue")}>← Voltar</button>
+              <button style={S.btn} onClick={()=>setStep("results")}>Calcular Comissões →</button>
+            </div>
+          </>
+        )}
 
-      <div style={{ textAlign: "center", padding: "16px", fontSize: 11, color: "#aaa", borderTop: "1px solid #e5e0d6", marginTop: 20 }}>
-        Maguje · Sistema de Comissões · {monthLabel}
+        {/* ── STEP 3: RESULTS ── */}
+        {!viewingHistory && step==="results" && (
+          <ResultsTable emps={displayEmployees} res={displayResults} sector={sector} setSector={setSector}
+            S={S} SECTORS={SECTORS} SECTOR_COLORS={SECTOR_COLORS} fmt={fmt}
+            onPrint={handlePrint} onSave={handleSaveHistory} showSave={true}
+            monthLabel={monthLabel}
+            absCountFn={absenceCountByEmp}
+            onBack={()=>setStep("absences")} />
+        )}
+      </div>
+
+      <div style={{textAlign:"center",padding:"14px",fontSize:11,color:"#aaa",borderTop:"1px solid #e5e0d6",marginTop:20}}>
+        Maguje · Comissões · {monthLabel}
       </div>
     </div>
+  );
+}
+
+function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS, fmt, onPrint, onSave, showSave, monthLabel, absCountFn, onBack }) {
+  const filteredEmps = sector==="Todos" ? emps : emps.filter(e=>e.sector===sector);
+  const totalComm = filteredEmps.reduce((s,e)=>s+(res.empTotals[e.id]||0),0);
+
+  return (
+    <>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:12,marginBottom:20}}>
+        {[
+          {label:"Total Bruto",val:fmt(res.totalBruto),color:"#1B4332"},
+          {label:"Desconto 33%",val:fmt(res.totalBruto*TAX_RATE),color:"#c0392b"},
+          {label:"Pool Global Líq.",val:fmt(res.totalGlobalPool),color:"#40916C"},
+          {label:"Comissões Indiv.",val:fmt(res.totalIndivComm),color:"#7B5EA7"},
+        ].map(m=>(
+          <div key={m.label} style={{background:"#fff",border:"1.5px solid #D4CFC4",borderRadius:4,padding:"13px 16px",textAlign:"center"}}>
+            <div style={{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,fontSize:17,color:m.color}}>{m.val}</div>
+            <div style={{fontSize:10,color:"#888",textTransform:"uppercase",letterSpacing:"0.07em",marginTop:3}}>{m.label}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{display:"flex",gap:6,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
+        {SECTORS.map(s2=>(
+          <button key={s2} style={sector===s2?S.tabActive:S.tab} onClick={()=>setSector(s2)}>{s2}</button>
+        ))}
+        <div style={{marginLeft:"auto",display:"flex",gap:8}}>
+          {showSave && <button style={S.btnGreen} onClick={onSave}>💾 Salvar Mês</button>}
+          <button style={S.btn} onClick={onPrint}>🖨 Exportar PDF</button>
+        </div>
+      </div>
+
+      <div style={{overflowX:"auto"}}>
+        <table style={{borderCollapse:"collapse",width:"100%"}}>
+          <thead>
+            <tr>
+              <th style={{...S.th,minWidth:220}}>Funcionário</th>
+              <th style={S.th}>Cargo</th>
+              <th style={{...S.th,textAlign:"center"}}>Tipo</th>
+              <th style={{...S.th,textAlign:"center"}}>Faltas</th>
+              <th style={{...S.th,textAlign:"right"}}>Comissão</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filteredEmps.slice().sort((a,b)=>(res.empTotals[b.id]||0)-(res.empTotals[a.id]||0)).map((emp,idx)=>{
+              const comm=res.empTotals[emp.id]||0;
+              const absCount=absCountFn(emp.id);
+              const color=SECTOR_COLORS[emp.sector]||"#555";
+              return (
+                <tr key={emp.id} className="row-hover">
+                  <td style={{...S.td,background:idx%2===0?"#fff":"#fafaf8",fontWeight:500}}>
+                    <div style={{fontSize:13}}>{emp.name}</div>
+                    <span style={{display:"inline-block",fontSize:10,padding:"1px 7px",borderRadius:20,marginTop:2,background:color+"18",color,border:`1px solid ${color}40`,textTransform:"uppercase",letterSpacing:"0.05em"}}>{emp.sector}</span>
+                  </td>
+                  <td style={{...S.td,fontSize:12,color:"#444",background:idx%2===0?"#fff":"#fafaf8"}}>{emp.role}</td>
+                  <td style={{...S.td,textAlign:"center",background:idx%2===0?"#fff":"#fafaf8"}}>
+                    {emp.type==="individual"
+                      ?<span style={{fontSize:11,padding:"2px 8px",borderRadius:20,background:"#7B5EA720",color:"#7B5EA7",border:"1px solid #7B5EA740"}}>Individual</span>
+                      :<span style={{fontSize:11,padding:"2px 8px",borderRadius:20,background:"#2D6A4F20",color:"#2D6A4F",border:"1px solid #2D6A4F40"}}>Global · {emp.points}pts</span>}
+                  </td>
+                  <td style={{...S.td,textAlign:"center",background:idx%2===0?"#fff":"#fafaf8"}}>
+                    {absCount>0?<span style={{background:"#fdecea",color:"#c0392b",borderRadius:10,padding:"2px 8px",fontSize:12,fontWeight:600}}>{absCount} dia{absCount>1?"s":""}</span>:<span style={{color:"#ccc",fontSize:12}}>—</span>}
+                  </td>
+                  <td style={{...S.td,textAlign:"right",background:idx%2===0?"#fff":"#fafaf8"}}>
+                    <span style={{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,fontSize:15,color:comm>0?"#1B4332":"#bbb"}}>{fmt(comm)}</span>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+          <tfoot>
+            <tr style={{background:"#f0f5f0",borderTop:"2px solid #1B4332"}}>
+              <td colSpan={4} style={{...S.td,fontWeight:600,color:"#1B4332",fontSize:13}}>Total {sector!=="Todos"?`— ${sector}`:""}</td>
+              <td style={{...S.td,textAlign:"right"}}>
+                <span style={{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,fontSize:17,color:"#1B4332"}}>{fmt(totalComm)}</span>
+              </td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+
+      {onBack && (
+        <div style={{marginTop:20}}>
+          <button style={S.btnOut} onClick={onBack}>← Voltar</button>
+        </div>
+      )}
+    </>
   );
 }
