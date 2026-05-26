@@ -421,14 +421,19 @@ function calcResults(employees, workDays, dailyRevenue, absences) {
 // O valor descontado de cada funcionário é redistribuído
 // proporcionalmente para todos pelo peso da comissão base.
 // Total distribuído permanece o mesmo.
+// O valor descontado de qualquer funcionário é redistribuído SOMENTE entre os funcionários de comissão global.
 function computeNetComms(employees, empTotals, deductions) {
-  const baseTotal = employees.reduce((s, e) => s + (empTotals[e.id] || 0), 0);
-  const dedTotal  = employees.reduce((s, e) => s + (parseFloat(deductions[e.id]) || 0), 0);
+  const dedTotal     = employees.reduce((s, e) => s + (parseFloat(deductions[e.id]) || 0), 0);
+  const globalEmps   = employees.filter(e => e.type !== "individual");
+  const globalBase   = globalEmps.reduce((s, e) => s + (empTotals[e.id] || 0), 0);
   const net = {};
   employees.forEach(emp => {
     const base = empTotals[emp.id] || 0;
     const ded  = parseFloat(deductions[emp.id]) || 0;
-    const share = baseTotal > 0 ? (base / baseTotal) * dedTotal : 0;
+    // Redistribuição: só funcionários globais recebem o valor descontado
+    const share = emp.type !== "individual" && globalBase > 0
+      ? (base / globalBase) * dedTotal
+      : 0;
     net[emp.id] = Math.max(0, base - ded + share);
   });
   return net;
@@ -1261,7 +1266,7 @@ function ResultsTable({ emps, res, nc, sector, setSector, S, SECTORS, SECTOR_COL
           <div style={{ fontSize: 11, color: "#555", display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center" }}>
             <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
               <span style={{ background: "#7B5EA7", color: "#fff", padding: "2px 8px", borderRadius: 10, fontSize: 11, fontWeight: 600 }}>−R$</span>
-              Insira um valor em "Desconto" para subtrair individualmente — o valor é redistribuído para os demais
+              Insira um valor em "Desconto" para subtrair individualmente — o valor é redistribuído proporcionalmente entre os funcionários do pool global
             </span>
             {onToggleMei && (
               <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
