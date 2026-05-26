@@ -51,13 +51,12 @@ function toTitleCase(str) {
   return str.toLowerCase().replace(/(?:^|\s)\S/g, a => a.toUpperCase());
 }
 
-// ── Ler cores da coluna A via JSZip (detectar cinza=global) ──
+// ── Ler cores da coluna A via JSZip ──────────────────────────
 async function getColumnAColors(arrayBuffer) {
   if (!window.JSZip) return {};
   try {
     const zip = await window.JSZip.loadAsync(arrayBuffer);
     const stylesXml = await zip.file("xl/styles.xml").async("string");
-    // Extrair fills
     const fills = [];
     const fillRx = /<fill>([\s\S]*?)<\/fill>/g;
     let fm;
@@ -69,7 +68,6 @@ async function getColumnAColors(arrayBuffer) {
       const rgbm = inner.match(/<fgColor[^>]*rgb="([^"]+)"/);
       fills.push(rgbm ? rgbm[1].toUpperCase() : null);
     }
-    // Mapear cellXfs -> cor
     const xfToColor = [];
     const cxm = stylesXml.match(/<cellXfs[^>]*>([\s\S]*?)<\/cellXfs>/);
     if (cxm) {
@@ -80,7 +78,6 @@ async function getColumnAColors(arrayBuffer) {
         xfToColor.push(fills[fid] !== undefined ? fills[fid] : null);
       }
     }
-    // Ler sheet1.xml - col A
     const sheetXml = await zip.file("xl/worksheets/sheet1.xml").async("string");
     const rowColors = {};
     const cRx = /<c r="A(\d+)"([^>]*?)(?:\/>|>)/g;
@@ -95,7 +92,7 @@ async function getColumnAColors(arrayBuffer) {
   } catch (e) { console.warn("getColumnAColors:", e); return {}; }
 }
 
-// ── Importar planilha Excel ───────────────────────────────────
+// ── Importar planilha de faturamento ──────────────────────────
 function parseExcelImport(file, employees, month, onComplete, onError) {
   const XLSX = window.XLSX;
   if (!XLSX) { onError("Biblioteca de Excel não carregada. Aguarde e tente novamente."); return; }
@@ -110,12 +107,10 @@ function parseExcelImport(file, employees, month, onComplete, onError) {
       const range = XLSX.utils.decode_range(ws["!ref"]);
       const getCell = (r, c) => ws[XLSX.utils.encode_cell({ r, c })];
       const getVal  = (r, c) => { const cell = getCell(r, c); return cell ? cell.v : null; };
-
       const dailyData = {};
       const newEmps = [];
       const log = [];
       let curEmp = null, curIsIndividual = false, fileMonth = null;
-
       for (let r = range.s.r; r <= range.e.r; r++) {
         const v0 = getVal(r, 0);
         if (v0 && String(v0).includes("Atendente:")) {
@@ -123,8 +118,7 @@ function parseExcelImport(file, employees, month, onComplete, onError) {
             .replace(/\s*-\s*(CONTRATO|GARCOM|EXTRA|GAVETA).*/i, "").trim();
           const matched = fuzzyMatchEmployee(rawName, employees);
           if (matched) {
-            curEmp = matched;
-            curIsIndividual = matched.type === "individual";
+            curEmp = matched; curIsIndividual = matched.type === "individual";
             log.push({ name: rawName, matched: matched.name, type: matched.type });
           } else {
             const excelRow = r + 1;
@@ -138,8 +132,7 @@ function parseExcelImport(file, employees, month, onComplete, onError) {
               curEmp = newEmp;
               log.push({ name: rawName, isNew: true, type: "individual" });
             } else {
-              curEmp = { type: "global_pool" };
-              curIsIndividual = false;
+              curEmp = { type: "global_pool" }; curIsIndividual = false;
               log.push({ name: rawName, type: "global" });
             }
           }
@@ -151,28 +144,86 @@ function parseExcelImport(file, employees, month, onComplete, onError) {
               day = v2.getDate();
               rowMonth = v2.getFullYear() + "-" + String(v2.getMonth() + 1).padStart(2, "0");
             } else if (typeof v2 === "number") {
-              try {
-                const d = XLSX.SSF.parse_date_code(v2);
-                day = d.d;
-                rowMonth = d.y + "-" + String(d.m).padStart(2, "0");
-              } catch { continue; }
+              try { const d = XLSX.SSF.parse_date_code(v2); day = d.d; rowMonth = d.y + "-" + String(d.m).padStart(2, "0"); }
+              catch { continue; }
             } else { continue; }
             if (!fileMonth && rowMonth) fileMonth = rowMonth;
             const total = parseFloat(v8) || 0;
             if (total <= 0 || !day) continue;
             if (!dailyData[day]) dailyData[day] = { individual: {}, globalSum: 0 };
-            if (curIsIndividual && curEmp && curEmp.id) {
+            if (curIsIndividual && curEmp && curEmp.id)
               dailyData[day].individual[curEmp.id] = (dailyData[day].individual[curEmp.id] || 0) + total;
-            } else if (curEmp) {
-              dailyData[day].globalSum += total;
-            }
+            else if (curEmp) dailyData[day].globalSum += total;
           }
         }
       }
       onComplete({ dailyData, newEmps, log, fileMonth });
-    } catch (err) {
-      onError("Erro ao processar planilha: " + err.message);
-    }
+    } catch (err) { onError("Erro ao processar planilha: " + err.message); }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+// ── Importar planilha de ponto ────────────────────────────────
+// Regras de classificação pelo MOTIVO:
+//   ESQUECIMENTO* → E (50% da comissão)
+//   ATESTADO*     → A (sem comissão, igual a falta)
+//   FALTA         → F (sem comissão)
+//   Tudo mais (FOLGA, DOMINGO, CERTIDÃO, LICENÇA, BANCO...)  → ignorar (100%)
+function parsePontoImport(file, employees, month, onComplete, onError) {
+  const XLSX = window.XLSX;
+  if (!XLSX) { onError("Biblioteca não carregada. Aguarde e tente novamente."); return; }
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      const data = new Uint8Array(e.target.result);
+      const wb = XLSX.read(data, { type: "array" });
+      const absToAdd = {};
+      const log = [];
+      let fileMonth = null;
+
+      for (const sheetName of wb.SheetNames) {
+        const ws = wb.Sheets[sheetName];
+        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
+        for (let i = 1; i < rows.length; i++) {
+          const row = rows[i];
+          if (!row || !row[0]) continue;
+          const name   = String(row[0]).trim();
+          const dayStr = row[3] != null ? String(row[3]).trim() : "";
+          const motivo = row[5] != null ? String(row[5]).trim().toUpperCase().replace(/\s+/g, " ") : "";
+          if (!name || !dayStr || !motivo) continue;
+
+          // Dia: "02/04 QUI" → day=2, month=4
+          const dayMatch = dayStr.match(/^(\d{1,2})\/(\d{1,2})/);
+          if (!dayMatch) continue;
+          const dayNum   = parseInt(dayMatch[1]);
+          const monthNum = parseInt(dayMatch[2]);
+
+          if (!fileMonth) {
+            const yr = parseInt((month || "").split("-")[0]) || new Date().getFullYear();
+            fileMonth = yr + "-" + String(monthNum).padStart(2, "0");
+          }
+
+          // Classificação
+          let status = null;
+          if (motivo.includes("ESQUECIMENTO")) status = "E";
+          else if (motivo.includes("ATESTADO"))   status = "A";
+          else if (motivo.trim() === "FALTA")      status = "F";
+          // FOLGA, DOMINGO DO MÊS, CERTIDÃO, LICENÇA, BANCO DE HORAS, HOME OFFICE → null (ignora)
+
+          if (!status) continue;
+
+          const emp = fuzzyMatchEmployee(name, employees);
+          if (!emp) { log.push({ name, status, matched: false }); continue; }
+
+          if (!absToAdd[emp.id]) absToAdd[emp.id] = {};
+          if (!absToAdd[emp.id][dayNum]) {
+            absToAdd[emp.id][dayNum] = status;
+            log.push({ name, matched: emp.name, day: dayNum, status });
+          }
+        }
+      }
+      onComplete({ absToAdd, log, fileMonth });
+    } catch (err) { onError("Erro ao processar ponto: " + err.message); }
   };
   reader.readAsArrayBuffer(file);
 }
@@ -299,52 +350,39 @@ const SECTORS = ["Todos", "Salão", "Bar", "Caixa", "Cozinha", "Limpeza"];
 const SECTOR_COLORS = { Salão: "#2D6A4F", Bar: "#1B4332", Caixa: "#40916C", Cozinha: "#B5450B", Limpeza: "#7B5EA7" };
 
 // ── Cálculo de comissões ──────────────────────────────────────
-// Regra: venda bruta - 33% = líquido
-//   29% do líquido → garçom individual
-//   71% do líquido → pool global (junto com faturamento global do dia)
+// F e A = sem comissão no dia · E = 50% · MEI = sem desconto dos 33%
 function calcResults(employees, workDays, dailyRevenue, absences) {
   const indivEmployees = employees.filter(e => e.type === "individual");
   const globalEmployees = employees.filter(e => e.type === "global");
   const getStatus = (empId, day) => (absences[empId] || {})[day] || null;
   const getDayRevenue = day => dailyRevenue[day] || { global: "", individual: {} };
-
   const empTotals = {};
   employees.forEach(e => (empTotals[e.id] = 0));
   let totalBruto = 0, totalIndivComm = 0, totalGlobalPool = 0;
 
   workDays.forEach(day => {
     const dr = getDayRevenue(day);
-
-    // Faturamento global direto do dia
     const globalBruto = parseFloat(dr.global) || 0;
     const globalNet = globalBruto * (1 - TAX_RATE);
     totalBruto += globalBruto;
-
-    // Vendas individuais: 29% → garçom, 71% → pool global
     let indivContribToGlobal = 0;
     indivEmployees.forEach(emp => {
       const sale = parseFloat((dr.individual || {})[emp.id]) || 0;
       totalBruto += sale;
       const net = sale * (1 - TAX_RATE);
-      // 71% do líquido sempre vai para o pool global
       indivContribToGlobal += net * (1 - INDIVIDUAL_RATE);
-      // 29% do líquido → garçom (conforme status)
       const status = getStatus(emp.id, day);
-      if (status === "F") return;
+      if (status === "F" || status === "A") return;
       const factor = status === "E" ? 0.5 : 1;
       const garcomComm = net * INDIVIDUAL_RATE * factor;
       empTotals[emp.id] = (empTotals[emp.id] || 0) + garcomComm;
       totalIndivComm += garcomComm;
     });
-
-    // Pool global total do dia = faturamento global líquido + 71% das vendas individuais líquidas
     const totalDayGlobalPool = globalNet + indivContribToGlobal;
     totalGlobalPool += totalDayGlobalPool;
-
-    // Distribuir pool: G1 (Salão+Bar+Caixa) 73%, G2 (Cozinha+Limpeza) 27%
     const getEffPts = emp => {
       const s = getStatus(emp.id, day);
-      if (s === "F") return 0;
+      if (s === "F" || s === "A") return 0;
       if (s === "E") return emp.points * 0.5;
       return emp.points;
     };
@@ -356,6 +394,11 @@ function calcResults(employees, workDays, dailyRevenue, absences) {
     const g2Pts = g2.reduce((s, e) => s + getEffPts(e), 0);
     g1.forEach(e => { const p = getEffPts(e); if (g1Pts > 0 && p > 0) empTotals[e.id] = (empTotals[e.id] || 0) + (p / g1Pts) * g1Pool; });
     g2.forEach(e => { const p = getEffPts(e); if (g2Pts > 0 && p > 0) empTotals[e.id] = (empTotals[e.id] || 0) + (p / g2Pts) * g2Pool; });
+  });
+
+  // MEI: undo the 33% deduction (paga comissão sobre valor bruto)
+  employees.forEach(emp => {
+    if (emp.mei) empTotals[emp.id] = empTotals[emp.id] / (1 - TAX_RATE);
   });
 
   return { empTotals, totalBruto, totalIndivComm, totalGlobalPool };
@@ -378,13 +421,17 @@ function MainApp() {
   const [sector, setSector] = useState("Todos");
   const [showAdd, setShowAdd] = useState(false);
   const [newEmp, setNewEmp] = useState({ name: "", role: "", sector: "Salão", type: "individual", points: 15 });
+  const [editingEmpId, setEditingEmpId] = useState(null);
+  const [editingEmpData, setEditingEmpData] = useState(null);
   const [history, setHistory] = useState(loadHistory);
   const [viewingHistory, setViewingHistory] = useState(null);
   const [showHistory, setShowHistory] = useState(false);
-  const [halfEmpIds, setHalfEmpIds] = useState({});  // 50% por funcionário
+  const [halfEmpIds, setHalfEmpIds] = useState({});
   const [importMsg, setImportMsg] = useState(null);
+  const [pontoMsg, setPontoMsg] = useState(null);
   const printRef = useRef();
   const importInputRef = useRef();
+  const pontoInputRef = useRef();
 
   const [dailyRevenue, setDailyRevenue] = useState(() => loadMonthData(initialMonth).rev);
   const [absences, setAbsences]         = useState(() => loadMonthData(initialMonth).abs);
@@ -415,16 +462,58 @@ function MainApp() {
     }));
 
   const getStatus = (empId, day) => (absences[empId] || {})[day] || null;
+
+  // Ciclo: · → F → E → A → ·
   const toggleAbsence = (empId, day) =>
     setAbsences(p => {
       const cur = (p[empId] || {})[day] || null;
-      const next = cur === null ? "F" : cur === "F" ? "E" : null;
+      const next = cur === null ? "F" : cur === "F" ? "E" : cur === "E" ? "A" : null;
       return { ...p, [empId]: { ...(p[empId] || {}), [day]: next } };
     });
-  const absenceCountByEmp = empId => workDays.filter(d => getStatus(empId, d) === "F").length;
-  const forgetCountByEmp  = empId => workDays.filter(d => getStatus(empId, d) === "E").length;
+
+  const setAbsenceStatus = (empId, day, status) =>
+    setAbsences(p => ({ ...p, [empId]: { ...(p[empId] || {}), [day]: status } }));
+
+  const faltaCountByEmp = empId => workDays.filter(d => getStatus(empId, d) === "F").length;
+  const esqCountByEmp   = empId => workDays.filter(d => getStatus(empId, d) === "E").length;
+  const atestCountByEmp = empId => workDays.filter(d => getStatus(empId, d) === "A").length;
 
   const toggleHalf = empId => setHalfEmpIds(p => ({ ...p, [empId]: !p[empId] }));
+
+  // MEI toggle (persiste no perfil do funcionário)
+  const toggleEmpMei = empId =>
+    setEmployees(p => p.map(e => e.id === empId ? { ...e, mei: !e.mei } : e));
+
+  // Editar funcionário
+  const startEditEmp = emp => {
+    setEditingEmpId(emp.id);
+    setEditingEmpData({ ...emp });
+    setShowAdd(false);
+  };
+  const saveEditEmp = () => {
+    if (!editingEmpData?.name?.trim()) return;
+    setEmployees(p => p.map(e => e.id === editingEmpId
+      ? { ...editingEmpData, points: parseInt(editingEmpData.points) || 15 }
+      : e));
+    setEditingEmpId(null); setEditingEmpData(null);
+  };
+  const cancelEditEmp = () => { setEditingEmpId(null); setEditingEmpData(null); };
+
+  // Deletar funcionário
+  const deleteEmp = empId => {
+    if (window.confirm("Remover este funcionário da lista?"))
+      setEmployees(p => p.filter(e => e.id !== empId));
+  };
+
+  // Reset por aba
+  const handleResetRevenue = () => {
+    if (window.confirm("Zerar todo o faturamento de " + monthLabel + "?\nEsta ação não pode ser desfeita."))
+      setDailyRevenue({});
+  };
+  const handleResetAbsences = () => {
+    if (window.confirm("Zerar todas as marcações de faltas de " + monthLabel + "?\nEsta ação não pode ser desfeita."))
+      setAbsences({});
+  };
 
   const indivEmployees = employees.filter(e => e.type === "individual");
   const results = useMemo(
@@ -443,12 +532,11 @@ function MainApp() {
   const handleSaveHistory = () => {
     const record = { monthKey: month, year, mon, monthLabel, savedAt: new Date().toISOString(), employees, results, totalBruto: results.totalBruto };
     const updated = [record, ...history.filter(h => h.monthKey !== month)].slice(0, 24);
-    setHistory(updated);
-    saveHistory(updated);
+    setHistory(updated); saveHistory(updated);
     alert("Comissões de " + monthLabel + " salvas!");
   };
 
-  // ── Importar planilha ────────────────────────────────────────
+  // ── Importar faturamento ─────────────────────────────────────
   const handleImportFile = e => {
     const file = e.target.files[0];
     if (!file) return;
@@ -456,9 +544,7 @@ function MainApp() {
     parseExcelImport(file, employees, month,
       ({ dailyData, newEmps, log, fileMonth }) => {
         if (fileMonth && fileMonth !== month) {
-          const ok = window.confirm(
-            "A planilha é do mês " + fileMonth + ", mas você está no mês " + month + ".\nDeseja importar mesmo assim?"
-          );
+          const ok = window.confirm("A planilha é do mês " + fileMonth + ", mas você está no mês " + month + ".\nDeseja importar mesmo assim?");
           if (!ok) { setImportMsg(null); return; }
         }
         if (newEmps.length > 0) setEmployees(prev => [...prev, ...newEmps]);
@@ -477,10 +563,43 @@ function MainApp() {
         const indC = log.filter(l => l.type === "individual").length;
         const gloC = log.filter(l => l.type === "global").length;
         const newC = newEmps.length;
-        setImportMsg({ type: "success", text: "✓ " + indC + " individuais, " + gloC + " globais" + (newC > 0 ? ", " + newC + " novo(s) adicionado(s)" : ".") });
+        setImportMsg({ type: "success", text: "✓ " + indC + " individuais, " + gloC + " globais" + (newC > 0 ? ", " + newC + " novo(s)" : ".") });
         setTimeout(() => setImportMsg(null), 6000);
       },
       err => { setImportMsg({ type: "error", text: err }); setTimeout(() => setImportMsg(null), 8000); }
+    );
+    e.target.value = "";
+  };
+
+  // ── Importar ponto ───────────────────────────────────────────
+  const handlePontoImport = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setPontoMsg({ type: "loading", text: "Processando planilha de ponto..." });
+    parsePontoImport(file, employees, month,
+      ({ absToAdd, log, fileMonth }) => {
+        if (fileMonth && fileMonth !== month) {
+          const ok = window.confirm("A planilha de ponto é do mês " + fileMonth + ", mas você está no mês " + month + ".\nDeseja importar mesmo assim?");
+          if (!ok) { setPontoMsg(null); return; }
+        }
+        setAbsences(prev => {
+          const next = { ...prev };
+          for (const [empId, days] of Object.entries(absToAdd)) {
+            next[empId] = { ...(next[empId] || {}), ...days };
+          }
+          return next;
+        });
+        const counts = { F: 0, E: 0, A: 0 };
+        log.filter(l => l.matched !== false).forEach(l => { counts[l.status] = (counts[l.status] || 0) + 1; });
+        const unmatched = log.filter(l => l.matched === false).length;
+        setPontoMsg({
+          type: "success",
+          text: "✓ " + (counts.F || 0) + "F · " + (counts.E || 0) + "E · " + (counts.A || 0) + "A importados" +
+                (unmatched > 0 ? " · " + unmatched + " não encontrados" : "")
+        });
+        setTimeout(() => setPontoMsg(null), 8000);
+      },
+      err => { setPontoMsg({ type: "error", text: err }); setTimeout(() => setPontoMsg(null), 8000); }
     );
     e.target.value = "";
   };
@@ -494,6 +613,7 @@ function MainApp() {
         *{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;font-size:11px;color:#111;padding:20px}
         h1{font-size:16px;color:#1B4332;margin-bottom:4px}.sub{font-size:11px;color:#666;margin-bottom:16px}
         .half-badge{display:inline-block;background:#f39c12;color:#fff;padding:2px 8px;border-radius:10px;font-size:9px;margin-left:6px}
+        .mei-badge{display:inline-block;background:#27ae60;color:#fff;padding:2px 6px;border-radius:10px;font-size:9px;margin-left:4px}
         .summary{display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap}
         .sum-card{border:1px solid #ccc;border-radius:4px;padding:8px 14px;min-width:130px}
         .sum-val{font-size:14px;font-weight:700;color:#1B4332}.sum-lbl{font-size:9px;color:#888;text-transform:uppercase;letter-spacing:.06em;margin-top:2px}
@@ -501,7 +621,7 @@ function MainApp() {
         th{background:#1B4332;color:#fff;padding:7px 10px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.05em}
         td{padding:6px 10px;border-bottom:1px solid #eee;font-size:11px}tr:nth-child(even) td{background:#fafaf8}
         .comm{font-weight:700;text-align:right;color:#1B4332}.comm-half{font-weight:700;text-align:right;color:#e67e22}
-        .absent{color:#c0392b;font-weight:600}.forget{color:#f39c12;font-weight:600}
+        .absent{color:#c0392b;font-weight:600}.forget{color:#f39c12;font-weight:600}.attest{color:#2980b9;font-weight:600}
         tfoot td{background:#e8f0eb!important;font-weight:700;border-top:2px solid #1B4332}
         @media print{body{padding:10px}}
       </style></head><body>${content.innerHTML}</body></html>`);
@@ -527,12 +647,61 @@ function MainApp() {
     btnOut: { border: "1.5px solid #1B4332", background: "transparent", color: "#1B4332", padding: "8px 16px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", fontSize: 13 },
     btnGreen: { border: "1.5px solid #40916C", background: "#40916C", color: "#fff", padding: "8px 16px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", fontSize: 13 },
     btnOrange: { border: "1.5px solid #e67e22", background: "#e67e22", color: "#fff", padding: "8px 16px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", fontSize: 13 },
+    btnRed: { border: "1.5px solid #c0392b", background: "transparent", color: "#c0392b", padding: "7px 14px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", fontSize: 12 },
+    btnAmber: { border: "1.5px solid #f39c12", background: "#f39c12", color: "#fff", padding: "8px 16px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", fontSize: 13 },
     tab: { padding: "6px 14px", border: "1px solid #ccc", borderRadius: 20, cursor: "pointer", fontSize: 12, background: "transparent", fontFamily: "inherit" },
     tabActive: { padding: "6px 14px", border: "1px solid #1B4332", borderRadius: 20, cursor: "pointer", fontSize: 12, background: "#1B4332", color: "#fff", fontFamily: "inherit" },
     stepBtn: active => ({ padding: "8px 20px", border: "none", borderBottom: active ? "2px solid #1B4332" : "2px solid transparent", background: "transparent", cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: active ? 600 : 400, color: active ? "#1B4332" : "#888" }),
   };
 
-  // ── Conteúdo do PDF ───────────────────────────────────────────
+  // Painel de edição de funcionário (reutilizado nas 3 abas)
+  const EmpFormPanel = ({ data, setData, onSave, onCancel, title, borderColor }) => (
+    <div style={{ ...S.card, marginBottom: 16, borderColor: borderColor || "#f39c12" }}>
+      <div style={{ fontSize: 11, color: borderColor || "#f39c12", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 12 }}>{title}</div>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ flex: 2, minWidth: 150 }}>
+          <div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>Nome</div>
+          <input type="text" value={data.name} onChange={e => setData(p => ({ ...p, name: e.target.value }))} placeholder="Nome completo" style={S.input} />
+        </div>
+        <div style={{ flex: 1, minWidth: 120 }}>
+          <div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>Cargo</div>
+          <input type="text" value={data.role} onChange={e => setData(p => ({ ...p, role: e.target.value }))} placeholder="Cargo" style={S.input} />
+        </div>
+        <div style={{ flex: 1, minWidth: 100 }}>
+          <div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>Setor</div>
+          <select value={data.sector} onChange={e => setData(p => ({ ...p, sector: e.target.value }))} style={S.input}>
+            {["Salão", "Bar", "Caixa", "Cozinha", "Limpeza"].map(x => <option key={x}>{x}</option>)}
+          </select>
+        </div>
+        <div style={{ flex: 1, minWidth: 110 }}>
+          <div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>Tipo</div>
+          <select value={data.type} onChange={e => setData(p => ({ ...p, type: e.target.value }))} style={S.input}>
+            <option value="individual">Individual (Garçom)</option>
+            <option value="global">Global (Pool por pontos)</option>
+          </select>
+        </div>
+        {data.type === "global" && (
+          <div style={{ flex: 1, minWidth: 80 }}>
+            <div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>Pontos</div>
+            <input type="number" min="1" max="50" value={data.points} onChange={e => setData(p => ({ ...p, points: e.target.value }))} style={S.input} />
+          </div>
+        )}
+        <div style={{ flex: 1, minWidth: 80 }}>
+          <div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>MEI</div>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", marginTop: 4 }}>
+            <input type="checkbox" checked={!!data.mei} onChange={e => setData(p => ({ ...p, mei: e.target.checked }))} />
+            <span style={{ fontSize: 12 }}>MEI</span>
+          </label>
+        </div>
+        <div style={{ display: "flex", alignItems: "flex-end", gap: 8 }}>
+          <button style={S.btn} onClick={onSave}>Salvar</button>
+          <button style={S.btnOut} onClick={onCancel}>Cancelar</button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ── PDF Content ───────────────────────────────────────────────
   const PrintContent = ({ emps, res, label, halfIds }) => {
     const totalComm = emps.reduce((s, e) => s + (res.empTotals[e.id] || 0) * (halfIds[e.id] ? 0.5 : 1), 0);
     const hasHalf = emps.some(e => halfIds[e.id]);
@@ -561,22 +730,24 @@ function MainApp() {
             <table key={sec}>
               <thead>
                 <tr><th colSpan={5} style={{ background: "#2D6A4F" }}>{sec}</th></tr>
-                <tr><th>Funcionário</th><th>Cargo</th><th>Tipo</th><th style={{ textAlign: "center" }}>F/E</th><th style={{ textAlign: "right" }}>Comissão</th></tr>
+                <tr><th>Funcionário</th><th>Cargo</th><th>Tipo</th><th style={{ textAlign: "center" }}>F/E/A</th><th style={{ textAlign: "right" }}>Comissão</th></tr>
               </thead>
               <tbody>
                 {secEmps.sort((a, b) => (res.empTotals[b.id] || 0) - (res.empTotals[a.id] || 0)).map(emp => {
                   const comm = (res.empTotals[emp.id] || 0) * (halfIds[emp.id] ? 0.5 : 1);
-                  const abs = workDays.filter(d => getStatus(emp.id, d) === "F").length;
-                  const esc = workDays.filter(d => getStatus(emp.id, d) === "E").length;
+                  const fC = workDays.filter(d => getStatus(emp.id, d) === "F").length;
+                  const eC = workDays.filter(d => getStatus(emp.id, d) === "E").length;
+                  const aC = workDays.filter(d => getStatus(emp.id, d) === "A").length;
                   return (
                     <tr key={emp.id}>
-                      <td>{emp.name}{halfIds[emp.id] && <span className="half-badge">50%</span>}</td>
+                      <td>{emp.name}{halfIds[emp.id] && <span className="half-badge">50%</span>}{emp.mei && <span className="mei-badge">MEI</span>}</td>
                       <td>{emp.role}</td>
                       <td>{emp.type === "individual" ? "Individual (29%)" : "Global (" + emp.points + "pts)"}</td>
                       <td style={{ textAlign: "center" }}>
-                        {abs > 0 && <span className="absent">{abs}F </span>}
-                        {esc > 0 && <span className="forget">{esc}E</span>}
-                        {abs === 0 && esc === 0 && "—"}
+                        {fC > 0 && <span className="absent">{fC}F </span>}
+                        {eC > 0 && <span className="forget">{eC}E </span>}
+                        {aC > 0 && <span className="attest">{aC}A</span>}
+                        {fC === 0 && eC === 0 && aC === 0 && "—"}
                       </td>
                       <td className={halfIds[emp.id] ? "comm-half" : "comm"}>{fmt(comm)}</td>
                     </tr>
@@ -599,6 +770,41 @@ function MainApp() {
     );
   };
 
+  // Badges de falta para reuso
+  const AbsBadges = ({ empId, small }) => {
+    const fC = faltaCountByEmp(empId), eC = esqCountByEmp(empId), aC = atestCountByEmp(empId);
+    const sz = small ? { fontSize: 10, padding: "1px 5px" } : { fontSize: 11, padding: "2px 7px" };
+    return (
+      <>
+        {fC > 0 && <span style={{ ...sz, background: "#fdecea", color: "#c0392b", borderRadius: 10, fontWeight: 600, marginRight: 2 }}>{fC}F</span>}
+        {eC > 0 && <span style={{ ...sz, background: "#fff3cd", color: "#7a5c00", borderRadius: 10, fontWeight: 600, marginRight: 2 }}>{eC}E</span>}
+        {aC > 0 && <span style={{ ...sz, background: "#dbeafe", color: "#1a6fa0", borderRadius: 10, fontWeight: 600 }}>{aC}A</span>}
+        {fC === 0 && eC === 0 && aC === 0 && <span style={{ color: "#ccc", fontSize: 12 }}>—</span>}
+      </>
+    );
+  };
+
+  // Botões editar/deletar por linha
+  const EmpActions = ({ emp, small }) => (
+    <span style={{ display: "inline-flex", gap: 4, marginLeft: 6 }}>
+      <button onClick={() => startEditEmp(emp)}
+        title="Editar"
+        style={{ background: "none", border: "1px solid #ccc", borderRadius: 3, cursor: "pointer", fontSize: small ? 10 : 11, padding: "1px 5px", color: "#666" }}>✏</button>
+      <button onClick={() => deleteEmp(emp.id)}
+        title="Remover"
+        style={{ background: "none", border: "1px solid #fbc8c8", borderRadius: 3, cursor: "pointer", fontSize: small ? 10 : 11, padding: "1px 5px", color: "#c0392b" }}>🗑</button>
+    </span>
+  );
+
+  // Msg helper
+  const MsgBox = ({ msg }) => !msg ? null : (
+    <div style={{ fontSize: 12, padding: "7px 12px", borderRadius: 4,
+      background: msg.type === "success" ? "#d4edda" : msg.type === "error" ? "#fdecea" : "#fff3cd",
+      color: msg.type === "success" ? "#155724" : msg.type === "error" ? "#721c24" : "#856404",
+      border: "1px solid " + (msg.type === "success" ? "#c3e6cb" : msg.type === "error" ? "#f5c6cb" : "#ffeeba"),
+      maxWidth: 360 }}>{msg.text}</div>
+  );
+
   return (
     <div style={S.wrap}>
       <style>{`
@@ -608,8 +814,8 @@ function MainApp() {
         .absent-btn { width:28px; height:28px; border-radius:4px; border:1.5px solid #ddd; background:#fff; cursor:pointer; font-size:12px; font-weight:700; display:flex; align-items:center; justify-content:center; transition:all 0.1s; font-family:inherit; }
         .absent-btn.marked-f { background:#c0392b; border-color:#c0392b; color:#fff; }
         .absent-btn.marked-e { background:#f39c12; border-color:#e67e22; color:#fff; }
-        .absent-btn:hover { border-color:#c0392b; }
-        .half-toggle { width:34px; height:18px; border-radius:9px; border:none; cursor:pointer; position:relative; transition:background 0.2s; flex-shrink:0; }
+        .absent-btn.marked-a { background:#2980b9; border-color:#1a6fa0; color:#fff; }
+        .absent-btn:hover { border-color:#888; }
         .row-hover:hover td { background:#fafaf7 !important; }
         ::-webkit-scrollbar { height:5px; width:5px; } ::-webkit-scrollbar-thumb { background:#ccc; border-radius:3px; }
         .print-hidden { display:none; }
@@ -677,6 +883,16 @@ function MainApp() {
 
       <div style={{ padding: "20px 24px" }}>
 
+        {/* Painel de edição (aparece em qualquer aba quando editingEmpId está ativo) */}
+        {!viewingHistory && editingEmpId && editingEmpData && (
+          <EmpFormPanel
+            data={editingEmpData} setData={setEditingEmpData}
+            onSave={saveEditEmp} onCancel={cancelEditEmp}
+            title={"✏ Editar: " + (editingEmpData.name || "")}
+            borderColor="#f39c12"
+          />
+        )}
+
         {/* ── HISTÓRICO ── */}
         {viewingHistory && (
           <>
@@ -690,7 +906,8 @@ function MainApp() {
               S={S} SECTORS={SECTORS} SECTOR_COLORS={SECTOR_COLORS} fmt={fmt}
               onPrint={handlePrint} showSave={false} onSave={null}
               halfEmpIds={halfEmpIds} toggleHalf={toggleHalf}
-              absCountFn={() => 0} forgetCountFn={() => 0} />
+              absCountFns={{ falta: () => 0, esq: () => 0, atest: () => 0 }}
+              isHistory={true} onToggleMei={null} onEditEmp={null} onDeleteEmp={null} />
           </>
         )}
 
@@ -707,16 +924,13 @@ function MainApp() {
                   </div>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                  {importMsg && (
-                    <div style={{ fontSize: 12, padding: "7px 12px", borderRadius: 4,
-                      background: importMsg.type === "success" ? "#d4edda" : importMsg.type === "error" ? "#fdecea" : "#fff3cd",
-                      color: importMsg.type === "success" ? "#155724" : importMsg.type === "error" ? "#721c24" : "#856404",
-                      border: "1px solid " + (importMsg.type === "success" ? "#c3e6cb" : importMsg.type === "error" ? "#f5c6cb" : "#ffeeba"),
-                      maxWidth: 300 }}>{importMsg.text}</div>
-                  )}
+                  <MsgBox msg={importMsg} />
                   <input ref={importInputRef} type="file" accept=".xlsx,.xls" style={{ display: "none" }} onChange={handleImportFile} />
                   <button style={S.btnOrange} onClick={() => importInputRef.current && importInputRef.current.click()}>
                     📂 Importar Planilha
+                  </button>
+                  <button style={S.btnRed} onClick={handleResetRevenue} title="Zerar faturamento do mês">
+                    🗑 Zerar Faturamento
                   </button>
                 </div>
               </div>
@@ -733,7 +947,7 @@ function MainApp() {
               <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 200 + workDays.length * 60 }}>
                 <thead>
                   <tr>
-                    <th style={{ ...S.th, position: "sticky", left: 0, zIndex: 2, minWidth: 200 }}>Funcionário</th>
+                    <th style={{ ...S.th, position: "sticky", left: 0, zIndex: 2, minWidth: 220 }}>Funcionário</th>
                     {workDays.map(d => {
                       const dow = new Date(year, mon - 1, d).getDay();
                       return <th key={d} style={{ ...S.th, textAlign: "center", minWidth: 60 }}>
@@ -752,7 +966,10 @@ function MainApp() {
                     return (
                       <tr key={emp.id} className="row-hover">
                         <td style={{ ...S.td, position: "sticky", left: 0, background: idx % 2 === 0 ? "#fff" : "#fafaf8", zIndex: 1, fontWeight: 500 }}>
-                          <div style={{ fontSize: 12 }}>{emp.name}</div>
+                          <div style={{ fontSize: 12, display: "flex", alignItems: "center" }}>
+                            {emp.name}
+                            <EmpActions emp={emp} small />
+                          </div>
                           <div style={{ fontSize: 10, color: SECTOR_COLORS[emp.sector] || "#888", marginTop: 1 }}>{emp.role}</div>
                         </td>
                         {workDays.map(d => (
@@ -816,67 +1033,80 @@ function MainApp() {
         {/* ── STEP 2: FALTAS ── */}
         {!viewingHistory && step === "absences" && (
           <>
+            {/* Legenda */}
             <div style={{ ...S.card, marginBottom: 16 }}>
-              <div style={{ fontSize: 11, color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Tipos de marcação</div>
+              <div style={{ fontSize: 11, color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Tipos de marcação · Clique para ciclar: · → F → E → A → ·</div>
               <div style={{ display: "flex", gap: 16, flexWrap: "wrap", fontSize: 12, color: "#555" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <span style={{ width: 26, height: 26, borderRadius: 4, background: "#c0392b", color: "#fff", display: "inline-flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 12 }}>F</span>
-                  <span><strong>Falta</strong> — sem comissão no dia</span>
+                  <span><strong>Falta</strong> — sem comissão</span>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <span style={{ width: 26, height: 26, borderRadius: 4, background: "#f39c12", color: "#fff", display: "inline-flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 12 }}>E</span>
-                  <span><strong>Esquecimento de batida</strong> — 50% da comissão do dia</span>
+                  <span><strong>Esquecimento de batida</strong> — 50% da comissão</span>
                 </div>
-                <div style={{ fontSize: 11, color: "#888", alignSelf: "center" }}>Clique para ciclar: · → F → E → ·</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ width: 26, height: 26, borderRadius: 4, background: "#2980b9", color: "#fff", display: "inline-flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 12 }}>A</span>
+                  <span><strong>Atestado médico</strong> — sem comissão</span>
+                </div>
               </div>
             </div>
+
+            {/* Importar ponto + controles */}
+            <div style={{ ...S.card, marginBottom: 16 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+                <div>
+                  <div style={{ fontSize: 11, color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>Importar planilha de ponto</div>
+                  <div style={{ fontSize: 12, color: "#555" }}>
+                    Classifica automaticamente: <strong>Falta→F</strong> · <strong>Esquecimento→E</strong> · <strong>Atestado→A</strong>. Folgas e domingos são ignorados.
+                  </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                  <MsgBox msg={pontoMsg} />
+                  <input ref={pontoInputRef} type="file" accept=".xlsx,.xls" style={{ display: "none" }} onChange={handlePontoImport} />
+                  <button style={S.btnAmber} onClick={() => pontoInputRef.current && pontoInputRef.current.click()}>
+                    📋 Importar Ponto
+                  </button>
+                  <button style={S.btnRed} onClick={handleResetAbsences} title="Zerar todas as marcações">
+                    🗑 Zerar Faltas
+                  </button>
+                </div>
+              </div>
+            </div>
+
             <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
               {SECTORS.map(s2 => (
                 <button key={s2} style={sector === s2 ? S.tabActive : S.tab} onClick={() => setSector(s2)}>{s2}</button>
               ))}
               <div style={{ marginLeft: "auto" }}>
-                <button style={{ ...S.btnOut, fontSize: 12, padding: "6px 14px" }} onClick={() => setShowAdd(!showAdd)}>
+                <button style={{ ...S.btnOut, fontSize: 12, padding: "6px 14px" }} onClick={() => { setShowAdd(!showAdd); setEditingEmpId(null); }}>
                   {showAdd ? "✕ Cancelar" : "+ Funcionário"}
                 </button>
               </div>
             </div>
-            {showAdd && (
-              <div style={{ ...S.card, marginBottom: 16, borderColor: "#52B788" }}>
-                <div style={{ fontSize: 11, color: "#1B4332", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 12 }}>Novo Funcionário</div>
-                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                  <div style={{ flex: 2, minWidth: 150 }}><div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>Nome</div>
-                    <input type="text" value={newEmp.name} onChange={e => setNewEmp(p => ({ ...p, name: e.target.value }))} placeholder="Nome completo" style={S.input} /></div>
-                  <div style={{ flex: 1, minWidth: 120 }}><div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>Cargo</div>
-                    <input type="text" value={newEmp.role} onChange={e => setNewEmp(p => ({ ...p, role: e.target.value }))} placeholder="Cargo" style={S.input} /></div>
-                  <div style={{ flex: 1, minWidth: 100 }}><div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>Setor</div>
-                    <select value={newEmp.sector} onChange={e => setNewEmp(p => ({ ...p, sector: e.target.value }))} style={S.input}>
-                      {["Salão", "Bar", "Caixa", "Cozinha", "Limpeza"].map(x => <option key={x}>{x}</option>)}
-                    </select></div>
-                  <div style={{ flex: 1, minWidth: 110 }}><div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>Tipo</div>
-                    <select value={newEmp.type} onChange={e => setNewEmp(p => ({ ...p, type: e.target.value }))} style={S.input}>
-                      <option value="individual">Individual (Garçom)</option>
-                      <option value="global">Global (Pool por pontos)</option>
-                    </select></div>
-                  {newEmp.type === "global" && <div style={{ flex: 1, minWidth: 80 }}><div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>Pontos</div>
-                    <input type="number" min="1" max="50" value={newEmp.points} onChange={e => setNewEmp(p => ({ ...p, points: e.target.value }))} style={S.input} /></div>}
-                  <div style={{ display: "flex", alignItems: "flex-end" }}>
-                    <button style={S.btn} onClick={addEmployee}>Adicionar</button>
-                  </div>
-                </div>
-              </div>
+
+            {showAdd && !editingEmpId && (
+              <EmpFormPanel
+                data={newEmp} setData={setNewEmp}
+                onSave={addEmployee}
+                onCancel={() => setShowAdd(false)}
+                title="Novo Funcionário"
+                borderColor="#52B788"
+              />
             )}
+
             <div style={{ overflowX: "auto" }}>
               <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 220 + workDays.length * 42 }}>
                 <thead>
                   <tr>
-                    <th style={{ ...S.th, position: "sticky", left: 0, zIndex: 2, minWidth: 220 }}>Funcionário</th>
+                    <th style={{ ...S.th, position: "sticky", left: 0, zIndex: 2, minWidth: 230 }}>Funcionário</th>
                     {workDays.map(d => {
                       const dow = new Date(year, mon - 1, d).getDay();
                       return <th key={d} style={{ ...S.th, textAlign: "center", minWidth: 42, padding: "8px 4px" }}>
                         <div>{d}</div><div style={{ fontWeight: 300, fontSize: 9, opacity: 0.7 }}>{DOW_LABELS[dow]}</div>
                       </th>;
                     })}
-                    <th style={{ ...S.th, textAlign: "center", minWidth: 80 }}>F / E</th>
+                    <th style={{ ...S.th, textAlign: "center", minWidth: 90 }}>F / E / A</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -886,35 +1116,33 @@ function MainApp() {
                   ].map(group => group.emps.length === 0 ? null : (
                     <React.Fragment key={group.label}>
                       <tr><td colSpan={workDays.length + 2} style={{ ...S.td, background: "#1B433210", fontWeight: 600, fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em", color: "#1B4332", padding: "10px 12px" }}>{group.label}</td></tr>
-                      {group.emps.map((emp, idx) => {
-                        const absCount = absenceCountByEmp(emp.id);
-                        const escCount = forgetCountByEmp(emp.id);
-                        return (
-                          <tr key={emp.id} className="row-hover">
-                            <td style={{ ...S.td, position: "sticky", left: 0, background: idx % 2 === 0 ? "#fff" : "#fafaf8", zIndex: 1 }}>
-                              <div style={{ fontSize: 12, fontWeight: 500 }}>{emp.name}</div>
-                              <div style={{ fontSize: 10, color: SECTOR_COLORS[emp.sector] || "#888", marginTop: 1 }}>{emp.role} · {emp.sector}</div>
-                            </td>
-                            {workDays.map(d => {
-                              const status = getStatus(emp.id, d);
-                              return (
-                                <td key={d} style={{ ...S.td, textAlign: "center", padding: "5px 4px", background: status === "F" ? "#fdecea" : status === "E" ? "#fff8ee" : idx % 2 === 0 ? "#fff" : "#fafaf8" }}>
-                                  <button className={"absent-btn" + (status === "F" ? " marked-f" : status === "E" ? " marked-e" : "")}
-                                    onClick={() => toggleAbsence(emp.id, d)}
-                                    title={status === "F" ? "Falta" : status === "E" ? "Esquecimento (50%)" : "Presente"}>
-                                    {status || "·"}
-                                  </button>
-                                </td>
-                              );
-                            })}
-                            <td style={{ ...S.td, textAlign: "center", background: idx % 2 === 0 ? "#fff" : "#fafaf8" }}>
-                              {absCount > 0 && <span style={{ background: "#fdecea", color: "#c0392b", borderRadius: 10, padding: "2px 7px", fontSize: 11, fontWeight: 600, marginRight: 3 }}>{absCount}F</span>}
-                              {escCount > 0 && <span style={{ background: "#fff3cd", color: "#7a5c00", borderRadius: 10, padding: "2px 7px", fontSize: 11, fontWeight: 600 }}>{escCount}E</span>}
-                              {absCount === 0 && escCount === 0 && <span style={{ color: "#ccc", fontSize: 12 }}>—</span>}
-                            </td>
-                          </tr>
-                        );
-                      })}
+                      {group.emps.map((emp, idx) => (
+                        <tr key={emp.id} className="row-hover">
+                          <td style={{ ...S.td, position: "sticky", left: 0, background: idx % 2 === 0 ? "#fff" : "#fafaf8", zIndex: 1 }}>
+                            <div style={{ fontSize: 12, fontWeight: 500, display: "flex", alignItems: "center" }}>
+                              {emp.name}
+                              <EmpActions emp={emp} small />
+                            </div>
+                            <div style={{ fontSize: 10, color: SECTOR_COLORS[emp.sector] || "#888", marginTop: 1 }}>{emp.role} · {emp.sector}</div>
+                          </td>
+                          {workDays.map(d => {
+                            const status = getStatus(emp.id, d);
+                            const bgMap = { F: "#fdecea", E: "#fff8ee", A: "#dbeafe" };
+                            return (
+                              <td key={d} style={{ ...S.td, textAlign: "center", padding: "5px 4px", background: bgMap[status] || (idx % 2 === 0 ? "#fff" : "#fafaf8") }}>
+                                <button className={"absent-btn" + (status === "F" ? " marked-f" : status === "E" ? " marked-e" : status === "A" ? " marked-a" : "")}
+                                  onClick={() => toggleAbsence(emp.id, d)}
+                                  title={status === "F" ? "Falta" : status === "E" ? "Esquecimento (50%)" : status === "A" ? "Atestado" : "Presente"}>
+                                  {status || "·"}
+                                </button>
+                              </td>
+                            );
+                          })}
+                          <td style={{ ...S.td, textAlign: "center", background: idx % 2 === 0 ? "#fff" : "#fafaf8" }}>
+                            <AbsBadges empId={emp.id} />
+                          </td>
+                        </tr>
+                      ))}
                     </React.Fragment>
                   ))}
                 </tbody>
@@ -933,7 +1161,11 @@ function MainApp() {
             S={S} SECTORS={SECTORS} SECTOR_COLORS={SECTOR_COLORS} fmt={fmt}
             onPrint={handlePrint} onSave={handleSaveHistory} showSave={true}
             halfEmpIds={halfEmpIds} toggleHalf={toggleHalf}
-            absCountFn={absenceCountByEmp} forgetCountFn={forgetCountByEmp}
+            absCountFns={{ falta: faltaCountByEmp, esq: esqCountByEmp, atest: atestCountByEmp }}
+            isHistory={false}
+            onToggleMei={toggleEmpMei}
+            onEditEmp={startEditEmp}
+            onDeleteEmp={deleteEmp}
             onBack={() => setStep("absences")} />
         )}
       </div>
@@ -946,14 +1178,15 @@ function MainApp() {
 }
 
 // ── Tabela de Resultados ──────────────────────────────────────
-function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS, fmt, onPrint, onSave, showSave, halfEmpIds, toggleHalf, absCountFn, forgetCountFn, onBack }) {
+function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS, fmt, onPrint, onSave, showSave,
+  halfEmpIds, toggleHalf, absCountFns, isHistory, onToggleMei, onEditEmp, onDeleteEmp, onBack }) {
   const filteredEmps = sector === "Todos" ? emps : emps.filter(e => e.sector === sector);
   const getComm = emp => (res.empTotals[emp.id] || 0) * (halfEmpIds[emp.id] ? 0.5 : 1);
   const totalComm = filteredEmps.reduce((s, e) => s + getComm(e), 0);
+  const { falta: faltaFn, esq: esqFn, atest: atestFn } = absCountFns || { falta: () => 0, esq: () => 0, atest: () => 0 };
 
   return (
     <>
-      {/* Cards de resumo */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 12, marginBottom: 20 }}>
         {[
           { label: "Total Bruto", val: fmt(res.totalBruto), color: "#1B4332" },
@@ -969,9 +1202,17 @@ function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS,
       </div>
 
       <div style={{ ...S.card, marginBottom: 16, background: "#f8f9ff", borderColor: "#c5cae9" }}>
-        <div style={{ fontSize: 11, color: "#555", display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ background: "#f39c12", color: "#fff", padding: "2px 8px", borderRadius: 10, fontSize: 11, fontWeight: 600 }}>½</span>
-          <span>Clique em <strong>½</strong> ao lado do nome para aplicar 50% da comissão individualmente</span>
+        <div style={{ fontSize: 11, color: "#555", display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center" }}>
+          <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ background: "#f39c12", color: "#fff", padding: "2px 8px", borderRadius: 10, fontSize: 11, fontWeight: 600 }}>½</span>
+            Clique para aplicar 50% individualmente
+          </span>
+          {!isHistory && (
+            <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ background: "#27ae60", color: "#fff", padding: "2px 8px", borderRadius: 10, fontSize: 11, fontWeight: 600 }}>MEI</span>
+              Clique para marcar MEI (sem desconto dos 33%)
+            </span>
+          )}
         </div>
       </div>
 
@@ -992,8 +1233,9 @@ function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS,
               <th style={{ ...S.th, minWidth: 220 }}>Funcionário</th>
               <th style={S.th}>Cargo</th>
               <th style={{ ...S.th, textAlign: "center" }}>Tipo</th>
-              <th style={{ ...S.th, textAlign: "center" }}>F / E</th>
+              <th style={{ ...S.th, textAlign: "center" }}>F/E/A</th>
               <th style={{ ...S.th, textAlign: "center", width: 50 }}>½</th>
+              {!isHistory && <th style={{ ...S.th, textAlign: "center", width: 60 }}>MEI</th>}
               <th style={{ ...S.th, textAlign: "right" }}>Comissão</th>
             </tr>
           </thead>
@@ -1001,13 +1243,23 @@ function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS,
             {filteredEmps.slice().sort((a, b) => (res.empTotals[b.id] || 0) - (res.empTotals[a.id] || 0)).map((emp, idx) => {
               const comm = getComm(emp);
               const isHalf = !!halfEmpIds[emp.id];
-              const absCount = absCountFn(emp.id);
-              const escCount = forgetCountFn(emp.id);
+              const fC = faltaFn(emp.id), eC = esqFn(emp.id), aC = atestFn(emp.id);
               const color = SECTOR_COLORS[emp.sector] || "#555";
               return (
                 <tr key={emp.id} className="row-hover">
                   <td style={{ ...S.td, background: idx % 2 === 0 ? "#fff" : "#fafaf8", fontWeight: 500 }}>
-                    <div style={{ fontSize: 13 }}>{emp.name}</div>
+                    <div style={{ fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}>
+                      {emp.name}
+                      {emp.mei && <span style={{ background: "#27ae60", color: "#fff", padding: "1px 6px", borderRadius: 10, fontSize: 9, fontWeight: 700 }}>MEI</span>}
+                      {!isHistory && onEditEmp && (
+                        <span style={{ display: "inline-flex", gap: 3, marginLeft: 2 }}>
+                          <button onClick={() => onEditEmp(emp)} title="Editar"
+                            style={{ background: "none", border: "1px solid #ccc", borderRadius: 3, cursor: "pointer", fontSize: 10, padding: "1px 4px", color: "#666" }}>✏</button>
+                          <button onClick={() => onDeleteEmp(emp.id)} title="Remover"
+                            style={{ background: "none", border: "1px solid #fbc8c8", borderRadius: 3, cursor: "pointer", fontSize: 10, padding: "1px 4px", color: "#c0392b" }}>🗑</button>
+                        </span>
+                      )}
+                    </div>
                     <span style={{ display: "inline-block", fontSize: 10, padding: "1px 7px", borderRadius: 20, marginTop: 2, background: color + "18", color, border: "1px solid " + color + "40", textTransform: "uppercase", letterSpacing: "0.05em" }}>{emp.sector}</span>
                   </td>
                   <td style={{ ...S.td, fontSize: 12, color: "#444", background: idx % 2 === 0 ? "#fff" : "#fafaf8" }}>{emp.role}</td>
@@ -1017,13 +1269,13 @@ function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS,
                       : <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 20, background: "#2D6A4F20", color: "#2D6A4F", border: "1px solid #2D6A4F40" }}>Global · {emp.points}pts</span>}
                   </td>
                   <td style={{ ...S.td, textAlign: "center", background: idx % 2 === 0 ? "#fff" : "#fafaf8" }}>
-                    {absCount > 0 && <span style={{ background: "#fdecea", color: "#c0392b", borderRadius: 10, padding: "2px 7px", fontSize: 11, fontWeight: 600, marginRight: 3 }}>{absCount}F</span>}
-                    {escCount > 0 && <span style={{ background: "#fff3cd", color: "#7a5c00", borderRadius: 10, padding: "2px 7px", fontSize: 11, fontWeight: 600 }}>{escCount}E</span>}
-                    {absCount === 0 && escCount === 0 && <span style={{ color: "#ccc", fontSize: 12 }}>—</span>}
+                    {fC > 0 && <span style={{ background: "#fdecea", color: "#c0392b", borderRadius: 10, padding: "2px 6px", fontSize: 11, fontWeight: 600, marginRight: 2 }}>{fC}F</span>}
+                    {eC > 0 && <span style={{ background: "#fff3cd", color: "#7a5c00", borderRadius: 10, padding: "2px 6px", fontSize: 11, fontWeight: 600, marginRight: 2 }}>{eC}E</span>}
+                    {aC > 0 && <span style={{ background: "#dbeafe", color: "#1a6fa0", borderRadius: 10, padding: "2px 6px", fontSize: 11, fontWeight: 600 }}>{aC}A</span>}
+                    {fC === 0 && eC === 0 && aC === 0 && <span style={{ color: "#ccc", fontSize: 12 }}>—</span>}
                   </td>
                   <td style={{ ...S.td, textAlign: "center", background: idx % 2 === 0 ? "#fff" : "#fafaf8" }}>
-                    <button
-                      onClick={() => toggleHalf(emp.id)}
+                    <button onClick={() => toggleHalf(emp.id)}
                       title={isHalf ? "50% ativo — clique para remover" : "Clique para aplicar 50%"}
                       style={{ width: 30, height: 24, borderRadius: 12, border: "none", cursor: "pointer",
                         background: isHalf ? "#f39c12" : "#e9ecef", color: isHalf ? "#fff" : "#999",
@@ -1031,11 +1283,23 @@ function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS,
                       ½
                     </button>
                   </td>
+                  {!isHistory && (
+                    <td style={{ ...S.td, textAlign: "center", background: idx % 2 === 0 ? "#fff" : "#fafaf8" }}>
+                      <button onClick={() => onToggleMei && onToggleMei(emp.id)}
+                        title={emp.mei ? "MEI ativo — sem desconto 33%" : "Marcar como MEI"}
+                        style={{ padding: "3px 8px", borderRadius: 4, border: "none", cursor: "pointer",
+                          background: emp.mei ? "#27ae60" : "#e9ecef", color: emp.mei ? "#fff" : "#999",
+                          fontSize: 11, fontWeight: emp.mei ? 700 : 400, fontFamily: "inherit", transition: "all 0.15s" }}>
+                        {emp.mei ? "MEI ✓" : "MEI"}
+                      </button>
+                    </td>
+                  )}
                   <td style={{ ...S.td, textAlign: "right", background: idx % 2 === 0 ? "#fff" : "#fafaf8" }}>
                     <span style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: 15,
                       color: isHalf ? "#e67e22" : comm > 0 ? "#1B4332" : "#bbb" }}>
                       {fmt(comm)}
                       {isHalf && <span style={{ fontSize: 10, marginLeft: 4, color: "#f39c12" }}>50%</span>}
+                      {emp.mei && <span style={{ fontSize: 9, marginLeft: 4, color: "#27ae60" }}>MEI</span>}
                     </span>
                   </td>
                 </tr>
@@ -1044,7 +1308,7 @@ function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS,
           </tbody>
           <tfoot>
             <tr style={{ background: "#f0f5f0", borderTop: "2px solid #1B4332" }}>
-              <td colSpan={5} style={{ ...S.td, fontWeight: 600, color: "#1B4332", fontSize: 13 }}>Total {sector !== "Todos" ? "— " + sector : ""}</td>
+              <td colSpan={isHistory ? 5 : 6} style={{ ...S.td, fontWeight: 600, color: "#1B4332", fontSize: 13 }}>Total {sector !== "Todos" ? "— " + sector : ""}</td>
               <td style={{ ...S.td, textAlign: "right" }}>
                 <span style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: 17, color: "#1B4332" }}>{fmt(totalComm)}</span>
               </td>
