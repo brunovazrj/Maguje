@@ -51,6 +51,21 @@ function toTitleCase(str) {
   return str.toLowerCase().replace(/(?:^|\s)\S/g, a => a.toUpperCase());
 }
 
+// ── Classificação de cor por matiz (verde=individual, cinza=global) ──
+// hex pode ser AARRGGBB (8 chars) ou RRGGBB (6 chars)
+function classifyColor(hex) {
+  if (!hex || hex.length < 6) return "none";
+  const s = hex.length >= 8 ? hex.slice(hex.length - 6) : hex.slice(-6);
+  const r = parseInt(s.slice(0, 2), 16);
+  const g = parseInt(s.slice(2, 4), 16);
+  const b = parseInt(s.slice(4, 6), 16);
+  // Verde: canal G dominante e diferença significativa
+  if (g > r + 20 && g > b + 20 && g > 80) return "green";
+  // Cinza: todos os canais próximos
+  if (Math.abs(r - g) < 30 && Math.abs(g - b) < 30 && Math.abs(r - b) < 30) return "gray";
+  return "other";
+}
+
 // ── Ler cores da coluna A via JSZip ──────────────────────────
 async function getColumnAColors(arrayBuffer) {
   if (!window.JSZip) return {};
@@ -93,6 +108,9 @@ async function getColumnAColors(arrayBuffer) {
 }
 
 // ── Importar planilha de faturamento ──────────────────────────
+// Verde (fundo verde) = garçom individual → 29% para ele, 71% para o pool global
+// Cinza / sem fundo    = global → total vai para faturamento diário global
+// Em ambos os casos: desconto de 33% é aplicado
 function parseExcelImport(file, employees, month, onComplete, onError) {
   const XLSX = window.XLSX;
   if (!XLSX) { onError("Biblioteca de Excel não carregada. Aguarde e tente novamente."); return; }
@@ -111,6 +129,7 @@ function parseExcelImport(file, employees, month, onComplete, onError) {
       const newEmps = [];
       const log = [];
       let curEmp = null, curIsIndividual = false, fileMonth = null;
+
       for (let r = range.s.r; r <= range.e.r; r++) {
         const v0 = getVal(r, 0);
         if (v0 && String(v0).includes("Atendente:")) {
@@ -118,22 +137,25 @@ function parseExcelImport(file, employees, month, onComplete, onError) {
             .replace(/\s*-\s*(CONTRATO|GARCOM|EXTRA|GAVETA).*/i, "").trim();
           const matched = fuzzyMatchEmployee(rawName, employees);
           if (matched) {
-            curEmp = matched; curIsIndividual = matched.type === "individual";
+            curEmp = matched;
+            curIsIndividual = matched.type === "individual";
             log.push({ name: rawName, matched: matched.name, type: matched.type });
           } else {
             const excelRow = r + 1;
             const color = colorMap[excelRow];
-            const isGray = color && color.toUpperCase() === "FFD3D3D3";
-            curIsIndividual = !isGray;
+            // Verde = individual, cinza/sem cor = global
+            const colorType = classifyColor(color);
+            curIsIndividual = colorType === "green";
             if (curIsIndividual) {
               const newId = "imp_" + Date.now() + "_" + r;
               const newEmp = { id: newId, name: toTitleCase(rawName), role: "Garçom", sector: "Salão", type: "individual", points: 0 };
               newEmps.push(newEmp);
               curEmp = newEmp;
-              log.push({ name: rawName, isNew: true, type: "individual" });
+              log.push({ name: rawName, isNew: true, type: "individual", colorType });
             } else {
-              curEmp = { type: "global_pool" }; curIsIndividual = false;
-              log.push({ name: rawName, type: "global" });
+              curEmp = { type: "global_pool" };
+              curIsIndividual = false;
+              log.push({ name: rawName, type: "global", colorType });
             }
           }
         } else if (!v0) {
@@ -153,7 +175,8 @@ function parseExcelImport(file, employees, month, onComplete, onError) {
             if (!dailyData[day]) dailyData[day] = { individual: {}, globalSum: 0 };
             if (curIsIndividual && curEmp && curEmp.id)
               dailyData[day].individual[curEmp.id] = (dailyData[day].individual[curEmp.id] || 0) + total;
-            else if (curEmp) dailyData[day].globalSum += total;
+            else if (curEmp)
+              dailyData[day].globalSum += total;
           }
         }
       }
@@ -164,11 +187,6 @@ function parseExcelImport(file, employees, month, onComplete, onError) {
 }
 
 // ── Importar planilha de ponto ────────────────────────────────
-// Regras de classificação pelo MOTIVO:
-//   ESQUECIMENTO* → E (50% da comissão)
-//   ATESTADO*     → A (sem comissão, igual a falta)
-//   FALTA         → F (sem comissão)
-//   Tudo mais (FOLGA, DOMINGO, CERTIDÃO, LICENÇA, BANCO...)  → ignorar (100%)
 function parsePontoImport(file, employees, month, onComplete, onError) {
   const XLSX = window.XLSX;
   if (!XLSX) { onError("Biblioteca não carregada. Aguarde e tente novamente."); return; }
@@ -180,7 +198,6 @@ function parsePontoImport(file, employees, month, onComplete, onError) {
       const absToAdd = {};
       const log = [];
       let fileMonth = null;
-
       for (const sheetName of wb.SheetNames) {
         const ws = wb.Sheets[sheetName];
         const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
@@ -191,30 +208,21 @@ function parsePontoImport(file, employees, month, onComplete, onError) {
           const dayStr = row[3] != null ? String(row[3]).trim() : "";
           const motivo = row[5] != null ? String(row[5]).trim().toUpperCase().replace(/\s+/g, " ") : "";
           if (!name || !dayStr || !motivo) continue;
-
-          // Dia: "02/04 QUI" → day=2, month=4
           const dayMatch = dayStr.match(/^(\d{1,2})\/(\d{1,2})/);
           if (!dayMatch) continue;
-          const dayNum   = parseInt(dayMatch[1]);
+          const dayNum = parseInt(dayMatch[1]);
           const monthNum = parseInt(dayMatch[2]);
-
           if (!fileMonth) {
             const yr = parseInt((month || "").split("-")[0]) || new Date().getFullYear();
             fileMonth = yr + "-" + String(monthNum).padStart(2, "0");
           }
-
-          // Classificação
           let status = null;
           if (motivo.includes("ESQUECIMENTO")) status = "E";
           else if (motivo.includes("ATESTADO"))   status = "A";
           else if (motivo.trim() === "FALTA")      status = "F";
-          // FOLGA, DOMINGO DO MÊS, CERTIDÃO, LICENÇA, BANCO DE HORAS, HOME OFFICE → null (ignora)
-
           if (!status) continue;
-
           const emp = fuzzyMatchEmployee(name, employees);
           if (!emp) { log.push({ name, status, matched: false }); continue; }
-
           if (!absToAdd[emp.id]) absToAdd[emp.id] = {};
           if (!absToAdd[emp.id][dayNum]) {
             absToAdd[emp.id][dayNum] = status;
@@ -350,7 +358,12 @@ const SECTORS = ["Todos", "Salão", "Bar", "Caixa", "Cozinha", "Limpeza"];
 const SECTOR_COLORS = { Salão: "#2D6A4F", Bar: "#1B4332", Caixa: "#40916C", Cozinha: "#B5450B", Limpeza: "#7B5EA7" };
 
 // ── Cálculo de comissões ──────────────────────────────────────
-// F e A = sem comissão no dia · E = 50% · MEI = sem desconto dos 33%
+// Venda bruta − 33% = líquido
+//   29% do líquido → garçom individual
+//   71% do líquido → pool global
+//     G1 (Salão+Caixa+Bar): 73% do pool
+//     G2 (Cozinha+Limpeza): 27% do pool
+// F e A = sem comissão · E = 50% · MEI = sem desconto dos 33%
 function calcResults(employees, workDays, dailyRevenue, absences) {
   const indivEmployees = employees.filter(e => e.type === "individual");
   const globalEmployees = employees.filter(e => e.type === "global");
@@ -370,11 +383,11 @@ function calcResults(employees, workDays, dailyRevenue, absences) {
       const sale = parseFloat((dr.individual || {})[emp.id]) || 0;
       totalBruto += sale;
       const net = sale * (1 - TAX_RATE);
-      indivContribToGlobal += net * (1 - INDIVIDUAL_RATE);
+      indivContribToGlobal += net * (1 - INDIVIDUAL_RATE); // 71% → pool global
       const status = getStatus(emp.id, day);
       if (status === "F" || status === "A") return;
       const factor = status === "E" ? 0.5 : 1;
-      const garcomComm = net * INDIVIDUAL_RATE * factor;
+      const garcomComm = net * INDIVIDUAL_RATE * factor; // 29% → garçom
       empTotals[emp.id] = (empTotals[emp.id] || 0) + garcomComm;
       totalIndivComm += garcomComm;
     });
@@ -386,8 +399,8 @@ function calcResults(employees, workDays, dailyRevenue, absences) {
       if (s === "E") return emp.points * 0.5;
       return emp.points;
     };
-    const g1Pool = totalDayGlobalPool * 0.73;
-    const g2Pool = totalDayGlobalPool * 0.27;
+    const g1Pool = totalDayGlobalPool * 0.73; // Salão + Caixa + Bar
+    const g2Pool = totalDayGlobalPool * 0.27; // Cozinha + Limpeza
     const g1 = globalEmployees.filter(e => ["Salão", "Bar", "Caixa"].includes(e.sector));
     const g2 = globalEmployees.filter(e => ["Cozinha", "Limpeza"].includes(e.sector));
     const g1Pts = g1.reduce((s, e) => s + getEffPts(e), 0);
@@ -396,12 +409,29 @@ function calcResults(employees, workDays, dailyRevenue, absences) {
     g2.forEach(e => { const p = getEffPts(e); if (g2Pts > 0 && p > 0) empTotals[e.id] = (empTotals[e.id] || 0) + (p / g2Pts) * g2Pool; });
   });
 
-  // MEI: undo the 33% deduction (paga comissão sobre valor bruto)
+  // MEI: desfaz o desconto de 33%
   employees.forEach(emp => {
     if (emp.mei) empTotals[emp.id] = empTotals[emp.id] / (1 - TAX_RATE);
   });
 
   return { empTotals, totalBruto, totalIndivComm, totalGlobalPool };
+}
+
+// ── Comissão líquida com descontos redistribuídos ─────────────
+// O valor descontado de cada funcionário é redistribuído
+// proporcionalmente para todos pelo peso da comissão base.
+// Total distribuído permanece o mesmo.
+function computeNetComms(employees, empTotals, deductions) {
+  const baseTotal = employees.reduce((s, e) => s + (empTotals[e.id] || 0), 0);
+  const dedTotal  = employees.reduce((s, e) => s + (parseFloat(deductions[e.id]) || 0), 0);
+  const net = {};
+  employees.forEach(emp => {
+    const base = empTotals[emp.id] || 0;
+    const ded  = parseFloat(deductions[emp.id]) || 0;
+    const share = baseTotal > 0 ? (base / baseTotal) * dedTotal : 0;
+    net[emp.id] = Math.max(0, base - ded + share);
+  });
+  return net;
 }
 
 // ── App root ──────────────────────────────────────────────────
@@ -426,7 +456,7 @@ function MainApp() {
   const [history, setHistory] = useState(loadHistory);
   const [viewingHistory, setViewingHistory] = useState(null);
   const [showHistory, setShowHistory] = useState(false);
-  const [halfEmpIds, setHalfEmpIds] = useState({});
+  const [deductions, setDeductions] = useState({}); // desconto por funcionário
   const [importMsg, setImportMsg] = useState(null);
   const [pontoMsg, setPontoMsg] = useState(null);
   const printRef = useRef();
@@ -446,7 +476,7 @@ function MainApp() {
     const { rev, abs } = loadMonthData(newMonth);
     setDailyRevenue(rev);
     setAbsences(abs);
-    setHalfEmpIds({});
+    setDeductions({});
   };
 
   const [year, mon] = month.split("-").map(Number);
@@ -462,7 +492,6 @@ function MainApp() {
     }));
 
   const getStatus = (empId, day) => (absences[empId] || {})[day] || null;
-
   // Ciclo: · → F → E → A → ·
   const toggleAbsence = (empId, day) =>
     setAbsences(p => {
@@ -471,54 +500,41 @@ function MainApp() {
       return { ...p, [empId]: { ...(p[empId] || {}), [day]: next } };
     });
 
-  const setAbsenceStatus = (empId, day, status) =>
-    setAbsences(p => ({ ...p, [empId]: { ...(p[empId] || {}), [day]: status } }));
-
   const faltaCountByEmp = empId => workDays.filter(d => getStatus(empId, d) === "F").length;
   const esqCountByEmp   = empId => workDays.filter(d => getStatus(empId, d) === "E").length;
   const atestCountByEmp = empId => workDays.filter(d => getStatus(empId, d) === "A").length;
 
-  const toggleHalf = empId => setHalfEmpIds(p => ({ ...p, [empId]: !p[empId] }));
-
-  // MEI toggle (persiste no perfil do funcionário)
   const toggleEmpMei = empId =>
     setEmployees(p => p.map(e => e.id === empId ? { ...e, mei: !e.mei } : e));
 
-  // Editar funcionário
-  const startEditEmp = emp => {
-    setEditingEmpId(emp.id);
-    setEditingEmpData({ ...emp });
-    setShowAdd(false);
-  };
+  const startEditEmp = emp => { setEditingEmpId(emp.id); setEditingEmpData({ ...emp }); setShowAdd(false); };
   const saveEditEmp = () => {
     if (!editingEmpData?.name?.trim()) return;
     setEmployees(p => p.map(e => e.id === editingEmpId
-      ? { ...editingEmpData, points: parseInt(editingEmpData.points) || 15 }
-      : e));
+      ? { ...editingEmpData, points: parseInt(editingEmpData.points) || 15 } : e));
     setEditingEmpId(null); setEditingEmpData(null);
   };
   const cancelEditEmp = () => { setEditingEmpId(null); setEditingEmpData(null); };
-
-  // Deletar funcionário
   const deleteEmp = empId => {
-    if (window.confirm("Remover este funcionário da lista?"))
-      setEmployees(p => p.filter(e => e.id !== empId));
+    if (window.confirm("Remover este funcionário?")) setEmployees(p => p.filter(e => e.id !== empId));
   };
 
-  // Reset por aba
   const handleResetRevenue = () => {
-    if (window.confirm("Zerar todo o faturamento de " + monthLabel + "?\nEsta ação não pode ser desfeita."))
-      setDailyRevenue({});
+    if (window.confirm("Zerar todo o faturamento de " + monthLabel + "?")) setDailyRevenue({});
   };
   const handleResetAbsences = () => {
-    if (window.confirm("Zerar todas as marcações de faltas de " + monthLabel + "?\nEsta ação não pode ser desfeita."))
-      setAbsences({});
+    if (window.confirm("Zerar todas as marcações de faltas de " + monthLabel + "?")) setAbsences({});
   };
 
   const indivEmployees = employees.filter(e => e.type === "individual");
   const results = useMemo(
     () => calcResults(employees, workDays, dailyRevenue, absences),
     [dailyRevenue, absences, employees, month]
+  );
+  // Comissões com descontos redistribuídos
+  const netComms = useMemo(
+    () => computeNetComms(employees, results.empTotals, deductions),
+    [results.empTotals, employees, deductions]
   );
 
   const activeHistory = viewingHistory ? history.find(h => h.monthKey === viewingHistory) : null;
@@ -527,6 +543,9 @@ function MainApp() {
   const displayMonthLabel = activeHistory
     ? new Date(activeHistory.year, activeHistory.mon - 1, 2).toLocaleString("pt-BR", { month: "long", year: "numeric" })
     : monthLabel;
+  const displayNetComms = activeHistory
+    ? computeNetComms(activeHistory.employees, activeHistory.results.empTotals, {})
+    : netComms;
   const filteredEmps = sector === "Todos" ? displayEmployees : displayEmployees.filter(e => e.sector === sector);
 
   const handleSaveHistory = () => {
@@ -544,7 +563,7 @@ function MainApp() {
     parseExcelImport(file, employees, month,
       ({ dailyData, newEmps, log, fileMonth }) => {
         if (fileMonth && fileMonth !== month) {
-          const ok = window.confirm("A planilha é do mês " + fileMonth + ", mas você está no mês " + month + ".\nDeseja importar mesmo assim?");
+          const ok = window.confirm("A planilha é do mês " + fileMonth + " mas você está no mês " + month + ".\nDeseja importar mesmo assim?");
           if (!ok) { setImportMsg(null); return; }
         }
         if (newEmps.length > 0) setEmployees(prev => [...prev, ...newEmps]);
@@ -579,14 +598,13 @@ function MainApp() {
     parsePontoImport(file, employees, month,
       ({ absToAdd, log, fileMonth }) => {
         if (fileMonth && fileMonth !== month) {
-          const ok = window.confirm("A planilha de ponto é do mês " + fileMonth + ", mas você está no mês " + month + ".\nDeseja importar mesmo assim?");
+          const ok = window.confirm("A planilha de ponto é do mês " + fileMonth + " mas você está no mês " + month + ".\nDeseja importar mesmo assim?");
           if (!ok) { setPontoMsg(null); return; }
         }
         setAbsences(prev => {
           const next = { ...prev };
-          for (const [empId, days] of Object.entries(absToAdd)) {
+          for (const [empId, days] of Object.entries(absToAdd))
             next[empId] = { ...(next[empId] || {}), ...days };
-          }
           return next;
         });
         const counts = { F: 0, E: 0, A: 0 };
@@ -604,6 +622,56 @@ function MainApp() {
     e.target.value = "";
   };
 
+  // ── Exportar Excel ───────────────────────────────────────────
+  const handleExportExcel = () => {
+    const XLSX = window.XLSX;
+    if (!XLSX) { alert("Biblioteca Excel não carregada."); return; }
+    const emps = displayEmployees;
+    const res  = displayResults;
+    const nc   = displayNetComms;
+    const totalDistr = emps.reduce((s, e) => s + (nc[e.id] || 0), 0);
+    const rows = [
+      ["Restaurante Maguje — Comissões", displayMonthLabel],
+      ["Gerado em", new Date().toLocaleDateString("pt-BR")],
+      [],
+      ["RESUMO"],
+      ["Total Bruto (R$)", res.totalBruto],
+      ["Pool Global Líquido (R$)", res.totalGlobalPool],
+      ["Comissões Individuais (R$)", res.totalIndivComm],
+      ["Total Distribuído (R$)", totalDistr],
+      [],
+      ["Funcionário", "Cargo", "Setor", "Tipo", "Faltas F", "Esq. E", "Atestado A", "Desconto R$", "Comissão Base R$", "Comissão Final R$", "MEI"],
+    ];
+    ["Salão", "Bar", "Caixa", "Cozinha", "Limpeza"].forEach(sec => {
+      const secEmps = emps.filter(e => e.sector === sec);
+      if (!secEmps.length) return;
+      rows.push([sec.toUpperCase()]);
+      secEmps
+        .slice().sort((a, b) => (res.empTotals[b.id] || 0) - (res.empTotals[a.id] || 0))
+        .forEach(emp => {
+          rows.push([
+            emp.name, emp.role, emp.sector,
+            emp.type === "individual" ? "Individual" : "Global (" + emp.points + "pts)",
+            faltaCountByEmp(emp.id), esqCountByEmp(emp.id), atestCountByEmp(emp.id),
+            parseFloat(deductions[emp.id]) || 0,
+            parseFloat((res.empTotals[emp.id] || 0).toFixed(2)),
+            parseFloat((nc[emp.id] || 0).toFixed(2)),
+            emp.mei ? "MEI" : "",
+          ]);
+        });
+      const secTotal = secEmps.reduce((s, e) => s + (nc[e.id] || 0), 0);
+      rows.push(["Total " + sec, "", "", "", "", "", "", "", "", parseFloat(secTotal.toFixed(2)), ""]);
+      rows.push([]);
+    });
+    rows.push(["TOTAL GERAL", "", "", "", "", "", "", "", "", parseFloat(totalDistr.toFixed(2)), ""]);
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    // Formatação básica de largura
+    ws["!cols"] = [{ wch: 32 }, { wch: 22 }, { wch: 10 }, { wch: 16 }, { wch: 8 }, { wch: 8 }, { wch: 10 }, { wch: 12 }, { wch: 18 }, { wch: 18 }, { wch: 5 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Comissões");
+    XLSX.writeFile(wb, "Maguje_Comissoes_" + month + ".xlsx");
+  };
+
   // ── PDF ──────────────────────────────────────────────────────
   const handlePrint = () => {
     const content = printRef.current;
@@ -612,7 +680,6 @@ function MainApp() {
       <style>
         *{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;font-size:11px;color:#111;padding:20px}
         h1{font-size:16px;color:#1B4332;margin-bottom:4px}.sub{font-size:11px;color:#666;margin-bottom:16px}
-        .half-badge{display:inline-block;background:#f39c12;color:#fff;padding:2px 8px;border-radius:10px;font-size:9px;margin-left:6px}
         .mei-badge{display:inline-block;background:#27ae60;color:#fff;padding:2px 6px;border-radius:10px;font-size:9px;margin-left:4px}
         .summary{display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap}
         .sum-card{border:1px solid #ccc;border-radius:4px;padding:8px 14px;min-width:130px}
@@ -620,8 +687,9 @@ function MainApp() {
         table{width:100%;border-collapse:collapse;margin-bottom:20px}
         th{background:#1B4332;color:#fff;padding:7px 10px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.05em}
         td{padding:6px 10px;border-bottom:1px solid #eee;font-size:11px}tr:nth-child(even) td{background:#fafaf8}
-        .comm{font-weight:700;text-align:right;color:#1B4332}.comm-half{font-weight:700;text-align:right;color:#e67e22}
+        .comm{font-weight:700;text-align:right;color:#1B4332}
         .absent{color:#c0392b;font-weight:600}.forget{color:#f39c12;font-weight:600}.attest{color:#2980b9;font-weight:600}
+        .ded{color:#7B5EA7;font-weight:600}
         tfoot td{background:#e8f0eb!important;font-weight:700;border-top:2px solid #1B4332}
         @media print{body{padding:10px}}
       </style></head><body>${content.innerHTML}</body></html>`);
@@ -649,12 +717,12 @@ function MainApp() {
     btnOrange: { border: "1.5px solid #e67e22", background: "#e67e22", color: "#fff", padding: "8px 16px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", fontSize: 13 },
     btnRed: { border: "1.5px solid #c0392b", background: "transparent", color: "#c0392b", padding: "7px 14px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", fontSize: 12 },
     btnAmber: { border: "1.5px solid #f39c12", background: "#f39c12", color: "#fff", padding: "8px 16px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", fontSize: 13 },
+    btnXls: { border: "1.5px solid #1D6F42", background: "#1D6F42", color: "#fff", padding: "8px 16px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", fontSize: 13 },
     tab: { padding: "6px 14px", border: "1px solid #ccc", borderRadius: 20, cursor: "pointer", fontSize: 12, background: "transparent", fontFamily: "inherit" },
     tabActive: { padding: "6px 14px", border: "1px solid #1B4332", borderRadius: 20, cursor: "pointer", fontSize: 12, background: "#1B4332", color: "#fff", fontFamily: "inherit" },
     stepBtn: active => ({ padding: "8px 20px", border: "none", borderBottom: active ? "2px solid #1B4332" : "2px solid transparent", background: "transparent", cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: active ? 600 : 400, color: active ? "#1B4332" : "#888" }),
   };
 
-  // Painel de edição de funcionário (reutilizado nas 3 abas)
   const EmpFormPanel = ({ data, setData, onSave, onCancel, title, borderColor }) => (
     <div style={{ ...S.card, marginBottom: 16, borderColor: borderColor || "#f39c12" }}>
       <div style={{ fontSize: 11, color: borderColor || "#f39c12", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 12 }}>{title}</div>
@@ -701,20 +769,19 @@ function MainApp() {
     </div>
   );
 
-  // ── PDF Content ───────────────────────────────────────────────
-  const PrintContent = ({ emps, res, label, halfIds }) => {
-    const totalComm = emps.reduce((s, e) => s + (res.empTotals[e.id] || 0) * (halfIds[e.id] ? 0.5 : 1), 0);
-    const hasHalf = emps.some(e => halfIds[e.id]);
+  // Conteúdo do PDF
+  const PrintContent = ({ emps, res, nc, label }) => {
+    const totalDistr = emps.reduce((s, e) => s + (nc[e.id] || 0), 0);
     return (
       <div>
-        <h1>Restaurante Maguje — Comissões{hasHalf && <span className="half-badge">50% parcial</span>}</h1>
+        <h1>Restaurante Maguje — Comissões</h1>
         <div className="sub">Referência: {label} · Gerado em {new Date().toLocaleDateString("pt-BR")}</div>
         <div className="summary">
           {[
             { label: "Total Bruto", val: fmt(res.totalBruto) },
             { label: "Pool Global Líq.", val: fmt(res.totalGlobalPool) },
             { label: "Comissões Indiv.", val: fmt(res.totalIndivComm) },
-            { label: "Total Distribuído", val: fmt(totalComm) },
+            { label: "Total Distribuído", val: fmt(totalDistr) },
           ].map(m => (
             <div key={m.label} className="sum-card">
               <div className="sum-val">{m.val}</div>
@@ -725,7 +792,7 @@ function MainApp() {
         {["Salão", "Bar", "Caixa", "Cozinha", "Limpeza"].map(sec => {
           const secEmps = emps.filter(e => e.sector === sec);
           if (!secEmps.length) return null;
-          const secTotal = secEmps.reduce((s, e) => s + (res.empTotals[e.id] || 0) * (halfIds[e.id] ? 0.5 : 1), 0);
+          const secTotal = secEmps.reduce((s, e) => s + (nc[e.id] || 0), 0);
           return (
             <table key={sec}>
               <thead>
@@ -733,23 +800,25 @@ function MainApp() {
                 <tr><th>Funcionário</th><th>Cargo</th><th>Tipo</th><th style={{ textAlign: "center" }}>F/E/A</th><th style={{ textAlign: "right" }}>Comissão</th></tr>
               </thead>
               <tbody>
-                {secEmps.sort((a, b) => (res.empTotals[b.id] || 0) - (res.empTotals[a.id] || 0)).map(emp => {
-                  const comm = (res.empTotals[emp.id] || 0) * (halfIds[emp.id] ? 0.5 : 1);
+                {secEmps.sort((a, b) => (nc[b.id] || 0) - (nc[a.id] || 0)).map(emp => {
+                  const comm = nc[emp.id] || 0;
                   const fC = workDays.filter(d => getStatus(emp.id, d) === "F").length;
                   const eC = workDays.filter(d => getStatus(emp.id, d) === "E").length;
                   const aC = workDays.filter(d => getStatus(emp.id, d) === "A").length;
+                  const ded = parseFloat(deductions[emp.id]) || 0;
                   return (
                     <tr key={emp.id}>
-                      <td>{emp.name}{halfIds[emp.id] && <span className="half-badge">50%</span>}{emp.mei && <span className="mei-badge">MEI</span>}</td>
+                      <td>{emp.name}{emp.mei && <span className="mei-badge">MEI</span>}</td>
                       <td>{emp.role}</td>
                       <td>{emp.type === "individual" ? "Individual (29%)" : "Global (" + emp.points + "pts)"}</td>
                       <td style={{ textAlign: "center" }}>
                         {fC > 0 && <span className="absent">{fC}F </span>}
                         {eC > 0 && <span className="forget">{eC}E </span>}
-                        {aC > 0 && <span className="attest">{aC}A</span>}
-                        {fC === 0 && eC === 0 && aC === 0 && "—"}
+                        {aC > 0 && <span className="attest">{aC}A </span>}
+                        {ded > 0 && <span className="ded">-{fmt(ded)}</span>}
+                        {fC === 0 && eC === 0 && aC === 0 && ded === 0 && "—"}
                       </td>
-                      <td className={halfIds[emp.id] ? "comm-half" : "comm"}>{fmt(comm)}</td>
+                      <td className="comm">{fmt(comm)}</td>
                     </tr>
                   );
                 })}
@@ -762,7 +831,7 @@ function MainApp() {
           <tfoot>
             <tr style={{ background: "#1B4332", color: "#fff" }}>
               <td colSpan={4} style={{ fontWeight: 700, fontSize: 13 }}>TOTAL GERAL</td>
-              <td style={{ fontWeight: 700, fontSize: 14, textAlign: "right" }}>{fmt(totalComm)}</td>
+              <td style={{ fontWeight: 700, fontSize: 14, textAlign: "right" }}>{fmt(totalDistr)}</td>
             </tr>
           </tfoot>
         </table>
@@ -770,33 +839,27 @@ function MainApp() {
     );
   };
 
-  // Badges de falta para reuso
-  const AbsBadges = ({ empId, small }) => {
+  const AbsBadges = ({ empId }) => {
     const fC = faltaCountByEmp(empId), eC = esqCountByEmp(empId), aC = atestCountByEmp(empId);
-    const sz = small ? { fontSize: 10, padding: "1px 5px" } : { fontSize: 11, padding: "2px 7px" };
     return (
       <>
-        {fC > 0 && <span style={{ ...sz, background: "#fdecea", color: "#c0392b", borderRadius: 10, fontWeight: 600, marginRight: 2 }}>{fC}F</span>}
-        {eC > 0 && <span style={{ ...sz, background: "#fff3cd", color: "#7a5c00", borderRadius: 10, fontWeight: 600, marginRight: 2 }}>{eC}E</span>}
-        {aC > 0 && <span style={{ ...sz, background: "#dbeafe", color: "#1a6fa0", borderRadius: 10, fontWeight: 600 }}>{aC}A</span>}
+        {fC > 0 && <span style={{ fontSize: 11, padding: "2px 6px", background: "#fdecea", color: "#c0392b", borderRadius: 10, fontWeight: 600, marginRight: 2 }}>{fC}F</span>}
+        {eC > 0 && <span style={{ fontSize: 11, padding: "2px 6px", background: "#fff3cd", color: "#7a5c00", borderRadius: 10, fontWeight: 600, marginRight: 2 }}>{eC}E</span>}
+        {aC > 0 && <span style={{ fontSize: 11, padding: "2px 6px", background: "#dbeafe", color: "#1a6fa0", borderRadius: 10, fontWeight: 600 }}>{aC}A</span>}
         {fC === 0 && eC === 0 && aC === 0 && <span style={{ color: "#ccc", fontSize: 12 }}>—</span>}
       </>
     );
   };
 
-  // Botões editar/deletar por linha
-  const EmpActions = ({ emp, small }) => (
-    <span style={{ display: "inline-flex", gap: 4, marginLeft: 6 }}>
-      <button onClick={() => startEditEmp(emp)}
-        title="Editar"
-        style={{ background: "none", border: "1px solid #ccc", borderRadius: 3, cursor: "pointer", fontSize: small ? 10 : 11, padding: "1px 5px", color: "#666" }}>✏</button>
-      <button onClick={() => deleteEmp(emp.id)}
-        title="Remover"
-        style={{ background: "none", border: "1px solid #fbc8c8", borderRadius: 3, cursor: "pointer", fontSize: small ? 10 : 11, padding: "1px 5px", color: "#c0392b" }}>🗑</button>
+  const EmpActions = ({ emp }) => (
+    <span style={{ display: "inline-flex", gap: 3, marginLeft: 5 }}>
+      <button onClick={() => startEditEmp(emp)} title="Editar"
+        style={{ background: "none", border: "1px solid #ccc", borderRadius: 3, cursor: "pointer", fontSize: 10, padding: "1px 4px", color: "#666" }}>✏</button>
+      <button onClick={() => deleteEmp(emp.id)} title="Remover"
+        style={{ background: "none", border: "1px solid #fbc8c8", borderRadius: 3, cursor: "pointer", fontSize: 10, padding: "1px 4px", color: "#c0392b" }}>🗑</button>
     </span>
   );
 
-  // Msg helper
   const MsgBox = ({ msg }) => !msg ? null : (
     <div style={{ fontSize: 12, padding: "7px 12px", borderRadius: 4,
       background: msg.type === "success" ? "#d4edda" : msg.type === "error" ? "#fdecea" : "#fff3cd",
@@ -822,7 +885,7 @@ function MainApp() {
       `}</style>
 
       <div ref={printRef} className="print-hidden">
-        <PrintContent emps={displayEmployees} res={displayResults} label={displayMonthLabel} halfIds={halfEmpIds} />
+        <PrintContent emps={displayEmployees} res={displayResults} nc={displayNetComms} label={displayMonthLabel} />
       </div>
 
       {/* Header */}
@@ -846,7 +909,6 @@ function MainApp() {
         </div>
       </div>
 
-      {/* Histórico */}
       {showHistory && (
         <div style={{ background: "#fff", borderBottom: "1px solid #D4CFC4", padding: "16px 24px" }}>
           <div style={{ fontSize: 11, color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 12 }}>Histórico</div>
@@ -872,7 +934,6 @@ function MainApp() {
         </div>
       )}
 
-      {/* Step tabs */}
       {!viewingHistory && (
         <div style={{ background: "#fff", borderBottom: "1px solid #e0dbd0", padding: "0 24px", display: "flex", gap: 0 }}>
           {[["revenue", "1. Faturamento Diário"], ["absences", "2. Faltas por Dia"], ["results", "3. Resultado"]].map(([key, label]) => (
@@ -883,14 +944,11 @@ function MainApp() {
 
       <div style={{ padding: "20px 24px" }}>
 
-        {/* Painel de edição (aparece em qualquer aba quando editingEmpId está ativo) */}
+        {/* Painel de edição */}
         {!viewingHistory && editingEmpId && editingEmpData && (
-          <EmpFormPanel
-            data={editingEmpData} setData={setEditingEmpData}
+          <EmpFormPanel data={editingEmpData} setData={setEditingEmpData}
             onSave={saveEditEmp} onCancel={cancelEditEmp}
-            title={"✏ Editar: " + (editingEmpData.name || "")}
-            borderColor="#f39c12"
-          />
+            title={"✏ Editar: " + (editingEmpData.name || "")} borderColor="#f39c12" />
         )}
 
         {/* ── HISTÓRICO ── */}
@@ -902,10 +960,10 @@ function MainApp() {
                 {" · "}<span style={{ cursor: "pointer", textDecoration: "underline" }} onClick={() => setViewingHistory(null)}>Voltar ao mês atual</span>
               </div>
             </div>
-            <ResultsTable emps={displayEmployees} res={displayResults} sector={sector} setSector={setSector}
-              S={S} SECTORS={SECTORS} SECTOR_COLORS={SECTOR_COLORS} fmt={fmt}
-              onPrint={handlePrint} showSave={false} onSave={null}
-              halfEmpIds={halfEmpIds} toggleHalf={toggleHalf}
+            <ResultsTable emps={displayEmployees} res={displayResults} nc={displayNetComms}
+              sector={sector} setSector={setSector} S={S} SECTORS={SECTORS} SECTOR_COLORS={SECTOR_COLORS} fmt={fmt}
+              onPrint={handlePrint} onExcelExport={handleExportExcel} showSave={false} onSave={null}
+              deductions={{}} setDeductions={null}
               absCountFns={{ falta: () => 0, esq: () => 0, atest: () => 0 }}
               isHistory={true} onToggleMei={null} onEditEmp={null} onDeleteEmp={null} />
           </>
@@ -914,13 +972,13 @@ function MainApp() {
         {/* ── STEP 1: FATURAMENTO ── */}
         {!viewingHistory && step === "revenue" && (
           <>
-            {/* Importar planilha */}
             <div style={{ ...S.card, marginBottom: 16 }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
                 <div>
                   <div style={{ fontSize: 11, color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>Importar planilha do sistema</div>
                   <div style={{ fontSize: 12, color: "#555" }}>
-                    Garçons <strong>sem fundo</strong> = venda individual · Fundo cinza = pool global
+                    Fundo <span style={{ background: "#d0f0c0", padding: "1px 6px", borderRadius: 3 }}>verde</span> = venda individual (29% garçom) ·{" "}
+                    Fundo <span style={{ background: "#e0e0e0", padding: "1px 6px", borderRadius: 3 }}>cinza</span> = faturamento global · Em ambos: −33%
                   </div>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
@@ -929,9 +987,7 @@ function MainApp() {
                   <button style={S.btnOrange} onClick={() => importInputRef.current && importInputRef.current.click()}>
                     📂 Importar Planilha
                   </button>
-                  <button style={S.btnRed} onClick={handleResetRevenue} title="Zerar faturamento do mês">
-                    🗑 Zerar Faturamento
-                  </button>
+                  <button style={S.btnRed} onClick={handleResetRevenue}>🗑 Zerar Faturamento</button>
                 </div>
               </div>
             </div>
@@ -939,7 +995,8 @@ function MainApp() {
             <div style={{ ...S.card, marginBottom: 16 }}>
               <div style={{ fontSize: 11, color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 6 }}>Regra de comissão</div>
               <div style={{ fontSize: 12, color: "#555", lineHeight: 1.7 }}>
-                Venda bruta − 33% = líquido · <strong>29%</strong> do líquido → garçom · <strong>71%</strong> do líquido → pool global. Valores <strong>salvos automaticamente</strong>.
+                Venda bruta − 33% = líquido · <strong>29%</strong> do líquido → garçom · <strong>71%</strong> do líquido → pool global
+                (G1 Salão+Bar+Caixa = 73% · G2 Cozinha+Limpeza = 27%). Valores <strong>salvos automaticamente</strong>.
               </div>
             </div>
 
@@ -967,8 +1024,7 @@ function MainApp() {
                       <tr key={emp.id} className="row-hover">
                         <td style={{ ...S.td, position: "sticky", left: 0, background: idx % 2 === 0 ? "#fff" : "#fafaf8", zIndex: 1, fontWeight: 500 }}>
                           <div style={{ fontSize: 12, display: "flex", alignItems: "center" }}>
-                            {emp.name}
-                            <EmpActions emp={emp} small />
+                            {emp.name}<EmpActions emp={emp} />
                           </div>
                           <div style={{ fontSize: 10, color: SECTOR_COLORS[emp.sector] || "#888", marginTop: 1 }}>{emp.role}</div>
                         </td>
@@ -1033,32 +1089,28 @@ function MainApp() {
         {/* ── STEP 2: FALTAS ── */}
         {!viewingHistory && step === "absences" && (
           <>
-            {/* Legenda */}
             <div style={{ ...S.card, marginBottom: 16 }}>
               <div style={{ fontSize: 11, color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Tipos de marcação · Clique para ciclar: · → F → E → A → ·</div>
               <div style={{ display: "flex", gap: 16, flexWrap: "wrap", fontSize: 12, color: "#555" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <span style={{ width: 26, height: 26, borderRadius: 4, background: "#c0392b", color: "#fff", display: "inline-flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 12 }}>F</span>
-                  <span><strong>Falta</strong> — sem comissão</span>
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <span style={{ width: 26, height: 26, borderRadius: 4, background: "#f39c12", color: "#fff", display: "inline-flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 12 }}>E</span>
-                  <span><strong>Esquecimento de batida</strong> — 50% da comissão</span>
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <span style={{ width: 26, height: 26, borderRadius: 4, background: "#2980b9", color: "#fff", display: "inline-flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 12 }}>A</span>
-                  <span><strong>Atestado médico</strong> — sem comissão</span>
-                </div>
+                {[
+                  { code: "F", bg: "#c0392b", label: "Falta", sub: "sem comissão" },
+                  { code: "E", bg: "#f39c12", label: "Esquecimento de batida", sub: "50% da comissão" },
+                  { code: "A", bg: "#2980b9", label: "Atestado médico", sub: "sem comissão" },
+                ].map(t => (
+                  <div key={t.code} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ width: 26, height: 26, borderRadius: 4, background: t.bg, color: "#fff", display: "inline-flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 12 }}>{t.code}</span>
+                    <span><strong>{t.label}</strong> — {t.sub}</span>
+                  </div>
+                ))}
               </div>
             </div>
 
-            {/* Importar ponto + controles */}
             <div style={{ ...S.card, marginBottom: 16 }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
                 <div>
                   <div style={{ fontSize: 11, color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>Importar planilha de ponto</div>
                   <div style={{ fontSize: 12, color: "#555" }}>
-                    Classifica automaticamente: <strong>Falta→F</strong> · <strong>Esquecimento→E</strong> · <strong>Atestado→A</strong>. Folgas e domingos são ignorados.
+                    <strong>Falta→F</strong> · <strong>Esquecimento→E</strong> · <strong>Atestado→A</strong> · Folgas e domingos são ignorados
                   </div>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
@@ -1067,9 +1119,7 @@ function MainApp() {
                   <button style={S.btnAmber} onClick={() => pontoInputRef.current && pontoInputRef.current.click()}>
                     📋 Importar Ponto
                   </button>
-                  <button style={S.btnRed} onClick={handleResetAbsences} title="Zerar todas as marcações">
-                    🗑 Zerar Faltas
-                  </button>
+                  <button style={S.btnRed} onClick={handleResetAbsences}>🗑 Zerar Faltas</button>
                 </div>
               </div>
             </div>
@@ -1086,13 +1136,9 @@ function MainApp() {
             </div>
 
             {showAdd && !editingEmpId && (
-              <EmpFormPanel
-                data={newEmp} setData={setNewEmp}
-                onSave={addEmployee}
-                onCancel={() => setShowAdd(false)}
-                title="Novo Funcionário"
-                borderColor="#52B788"
-              />
+              <EmpFormPanel data={newEmp} setData={setNewEmp}
+                onSave={addEmployee} onCancel={() => setShowAdd(false)}
+                title="Novo Funcionário" borderColor="#52B788" />
             )}
 
             <div style={{ overflowX: "auto" }}>
@@ -1120,8 +1166,7 @@ function MainApp() {
                         <tr key={emp.id} className="row-hover">
                           <td style={{ ...S.td, position: "sticky", left: 0, background: idx % 2 === 0 ? "#fff" : "#fafaf8", zIndex: 1 }}>
                             <div style={{ fontSize: 12, fontWeight: 500, display: "flex", alignItems: "center" }}>
-                              {emp.name}
-                              <EmpActions emp={emp} small />
+                              {emp.name}<EmpActions emp={emp} />
                             </div>
                             <div style={{ fontSize: 10, color: SECTOR_COLORS[emp.sector] || "#888", marginTop: 1 }}>{emp.role} · {emp.sector}</div>
                           </td>
@@ -1157,10 +1202,10 @@ function MainApp() {
 
         {/* ── STEP 3: RESULTADO ── */}
         {!viewingHistory && step === "results" && (
-          <ResultsTable emps={employees} res={results} sector={sector} setSector={setSector}
-            S={S} SECTORS={SECTORS} SECTOR_COLORS={SECTOR_COLORS} fmt={fmt}
-            onPrint={handlePrint} onSave={handleSaveHistory} showSave={true}
-            halfEmpIds={halfEmpIds} toggleHalf={toggleHalf}
+          <ResultsTable emps={employees} res={results} nc={netComms}
+            sector={sector} setSector={setSector} S={S} SECTORS={SECTORS} SECTOR_COLORS={SECTOR_COLORS} fmt={fmt}
+            onPrint={handlePrint} onExcelExport={handleExportExcel} onSave={handleSaveHistory} showSave={true}
+            deductions={deductions} setDeductions={setDeductions}
             absCountFns={{ falta: faltaCountByEmp, esq: esqCountByEmp, atest: atestCountByEmp }}
             isHistory={false}
             onToggleMei={toggleEmpMei}
@@ -1178,11 +1223,13 @@ function MainApp() {
 }
 
 // ── Tabela de Resultados ──────────────────────────────────────
-function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS, fmt, onPrint, onSave, showSave,
-  halfEmpIds, toggleHalf, absCountFns, isHistory, onToggleMei, onEditEmp, onDeleteEmp, onBack }) {
+function ResultsTable({ emps, res, nc, sector, setSector, S, SECTORS, SECTOR_COLORS, fmt,
+  onPrint, onExcelExport, onSave, showSave, deductions, setDeductions,
+  absCountFns, isHistory, onToggleMei, onEditEmp, onDeleteEmp, onBack }) {
+
   const filteredEmps = sector === "Todos" ? emps : emps.filter(e => e.sector === sector);
-  const getComm = emp => (res.empTotals[emp.id] || 0) * (halfEmpIds[emp.id] ? 0.5 : 1);
-  const totalComm = filteredEmps.reduce((s, e) => s + getComm(e), 0);
+  const totalComm = filteredEmps.reduce((s, e) => s + (nc[e.id] || 0), 0);
+  const totalDed  = emps.reduce((s, e) => s + (parseFloat(deductions[e.id]) || 0), 0);
   const { falta: faltaFn, esq: esqFn, atest: atestFn } = absCountFns || { falta: () => 0, esq: () => 0, atest: () => 0 };
 
   return (
@@ -1192,7 +1239,7 @@ function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS,
           { label: "Total Bruto", val: fmt(res.totalBruto), color: "#1B4332" },
           { label: "Pool Global Líq.", val: fmt(res.totalGlobalPool), color: "#40916C" },
           { label: "Comissões Indiv.", val: fmt(res.totalIndivComm), color: "#7B5EA7" },
-          { label: "Total Distribuído", val: fmt(filteredEmps.reduce((s,e)=>s+getComm(e),0)), color: "#B5450B" },
+          { label: "Total Distribuído", val: fmt(filteredEmps.reduce((s,e)=>s+(nc[e.id]||0),0)), color: "#B5450B" },
         ].map(m => (
           <div key={m.label} style={{ background: "#fff", border: "1.5px solid #D4CFC4", borderRadius: 4, padding: "13px 16px", textAlign: "center" }}>
             <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: 17, color: m.color }}>{m.val}</div>
@@ -1201,20 +1248,30 @@ function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS,
         ))}
       </div>
 
-      <div style={{ ...S.card, marginBottom: 16, background: "#f8f9ff", borderColor: "#c5cae9" }}>
-        <div style={{ fontSize: 11, color: "#555", display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center" }}>
-          <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ background: "#f39c12", color: "#fff", padding: "2px 8px", borderRadius: 10, fontSize: 11, fontWeight: 600 }}>½</span>
-            Clique para aplicar 50% individualmente
-          </span>
-          {!isHistory && (
-            <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <span style={{ background: "#27ae60", color: "#fff", padding: "2px 8px", borderRadius: 10, fontSize: 11, fontWeight: 600 }}>MEI</span>
-              Clique para marcar MEI (sem desconto dos 33%)
-            </span>
-          )}
+      {!isHistory && totalDed > 0 && (
+        <div style={{ ...S.card, marginBottom: 16, borderColor: "#7B5EA7", background: "#faf5ff" }}>
+          <div style={{ fontSize: 12, color: "#7B5EA7" }}>
+            Total descontado: <strong>{fmt(totalDed)}</strong> — redistribuído proporcionalmente entre todos os funcionários.
+          </div>
         </div>
-      </div>
+      )}
+
+      {!isHistory && (
+        <div style={{ ...S.card, marginBottom: 16, background: "#f8f9ff", borderColor: "#c5cae9" }}>
+          <div style={{ fontSize: 11, color: "#555", display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center" }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ background: "#7B5EA7", color: "#fff", padding: "2px 8px", borderRadius: 10, fontSize: 11, fontWeight: 600 }}>−R$</span>
+              Insira um valor em "Desconto" para subtrair individualmente — o valor é redistribuído para os demais
+            </span>
+            {onToggleMei && (
+              <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ background: "#27ae60", color: "#fff", padding: "2px 8px", borderRadius: 10, fontSize: 11, fontWeight: 600 }}>MEI</span>
+                Sem desconto dos 33%
+              </span>
+            )}
+          </div>
+        </div>
+      )}
 
       <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
         {SECTORS.map(s2 => (
@@ -1222,7 +1279,8 @@ function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS,
         ))}
         <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
           {showSave && <button style={S.btnGreen} onClick={onSave}>💾 Salvar Mês</button>}
-          <button style={S.btn} onClick={onPrint}>🖨 Exportar PDF</button>
+          <button style={S.btnXls} onClick={onExcelExport}>📊 Excel</button>
+          <button style={S.btn} onClick={onPrint}>🖨 PDF</button>
         </div>
       </div>
 
@@ -1234,17 +1292,19 @@ function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS,
               <th style={S.th}>Cargo</th>
               <th style={{ ...S.th, textAlign: "center" }}>Tipo</th>
               <th style={{ ...S.th, textAlign: "center" }}>F/E/A</th>
-              <th style={{ ...S.th, textAlign: "center", width: 50 }}>½</th>
               {!isHistory && <th style={{ ...S.th, textAlign: "center", width: 60 }}>MEI</th>}
+              {!isHistory && <th style={{ ...S.th, textAlign: "center", width: 100 }}>Desconto R$</th>}
               <th style={{ ...S.th, textAlign: "right" }}>Comissão</th>
             </tr>
           </thead>
           <tbody>
-            {filteredEmps.slice().sort((a, b) => (res.empTotals[b.id] || 0) - (res.empTotals[a.id] || 0)).map((emp, idx) => {
-              const comm = getComm(emp);
-              const isHalf = !!halfEmpIds[emp.id];
+            {filteredEmps.slice().sort((a, b) => (nc[b.id] || 0) - (nc[a.id] || 0)).map((emp, idx) => {
+              const comm = nc[emp.id] || 0;
+              const base = res.empTotals[emp.id] || 0;
+              const ded  = parseFloat(deductions[emp.id]) || 0;
               const fC = faltaFn(emp.id), eC = esqFn(emp.id), aC = atestFn(emp.id);
               const color = SECTOR_COLORS[emp.sector] || "#555";
+              const hasDiscount = ded > 0;
               return (
                 <tr key={emp.id} className="row-hover">
                   <td style={{ ...S.td, background: idx % 2 === 0 ? "#fff" : "#fafaf8", fontWeight: 500 }}>
@@ -1274,33 +1334,35 @@ function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS,
                     {aC > 0 && <span style={{ background: "#dbeafe", color: "#1a6fa0", borderRadius: 10, padding: "2px 6px", fontSize: 11, fontWeight: 600 }}>{aC}A</span>}
                     {fC === 0 && eC === 0 && aC === 0 && <span style={{ color: "#ccc", fontSize: 12 }}>—</span>}
                   </td>
-                  <td style={{ ...S.td, textAlign: "center", background: idx % 2 === 0 ? "#fff" : "#fafaf8" }}>
-                    <button onClick={() => toggleHalf(emp.id)}
-                      title={isHalf ? "50% ativo — clique para remover" : "Clique para aplicar 50%"}
-                      style={{ width: 30, height: 24, borderRadius: 12, border: "none", cursor: "pointer",
-                        background: isHalf ? "#f39c12" : "#e9ecef", color: isHalf ? "#fff" : "#999",
-                        fontSize: 12, fontWeight: 700, fontFamily: "inherit", transition: "all 0.15s" }}>
-                      ½
-                    </button>
-                  </td>
                   {!isHistory && (
                     <td style={{ ...S.td, textAlign: "center", background: idx % 2 === 0 ? "#fff" : "#fafaf8" }}>
                       <button onClick={() => onToggleMei && onToggleMei(emp.id)}
-                        title={emp.mei ? "MEI ativo — sem desconto 33%" : "Marcar como MEI"}
                         style={{ padding: "3px 8px", borderRadius: 4, border: "none", cursor: "pointer",
                           background: emp.mei ? "#27ae60" : "#e9ecef", color: emp.mei ? "#fff" : "#999",
-                          fontSize: 11, fontWeight: emp.mei ? 700 : 400, fontFamily: "inherit", transition: "all 0.15s" }}>
+                          fontSize: 11, fontWeight: emp.mei ? 700 : 400, fontFamily: "inherit" }}>
                         {emp.mei ? "MEI ✓" : "MEI"}
                       </button>
                     </td>
                   )}
+                  {!isHistory && (
+                    <td style={{ ...S.td, textAlign: "center", background: idx % 2 === 0 ? "#fff" : "#fafaf8", padding: "5px 6px" }}>
+                      <input type="number" min="0" step="0.01" placeholder="0"
+                        value={deductions[emp.id] || ""}
+                        onChange={ev => setDeductions(p => ({ ...p, [emp.id]: ev.target.value }))}
+                        style={{ ...S.input, width: 80, textAlign: "right", padding: "4px 6px",
+                          borderColor: hasDiscount ? "#7B5EA7" : "#ccc",
+                          background: hasDiscount ? "#faf5ff" : "#F5F0E8" }} />
+                    </td>
+                  )}
                   <td style={{ ...S.td, textAlign: "right", background: idx % 2 === 0 ? "#fff" : "#fafaf8" }}>
-                    <span style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: 15,
-                      color: isHalf ? "#e67e22" : comm > 0 ? "#1B4332" : "#bbb" }}>
+                    <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: 15, color: comm > 0 ? "#1B4332" : "#bbb" }}>
                       {fmt(comm)}
-                      {isHalf && <span style={{ fontSize: 10, marginLeft: 4, color: "#f39c12" }}>50%</span>}
-                      {emp.mei && <span style={{ fontSize: 9, marginLeft: 4, color: "#27ae60" }}>MEI</span>}
-                    </span>
+                    </div>
+                    {hasDiscount && !isHistory && (
+                      <div style={{ fontSize: 10, color: "#7B5EA7", marginTop: 1 }}>
+                        base: {fmt(base)} / −{fmt(ded)}
+                      </div>
+                    )}
                   </td>
                 </tr>
               );
@@ -1308,7 +1370,7 @@ function ResultsTable({ emps, res, sector, setSector, S, SECTORS, SECTOR_COLORS,
           </tbody>
           <tfoot>
             <tr style={{ background: "#f0f5f0", borderTop: "2px solid #1B4332" }}>
-              <td colSpan={isHistory ? 5 : 6} style={{ ...S.td, fontWeight: 600, color: "#1B4332", fontSize: 13 }}>Total {sector !== "Todos" ? "— " + sector : ""}</td>
+              <td colSpan={isHistory ? 4 : 6} style={{ ...S.td, fontWeight: 600, color: "#1B4332", fontSize: 13 }}>Total {sector !== "Todos" ? "— " + sector : ""}</td>
               <td style={{ ...S.td, textAlign: "right" }}>
                 <span style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: 17, color: "#1B4332" }}>{fmt(totalComm)}</span>
               </td>
