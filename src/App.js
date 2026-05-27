@@ -1,4 +1,6 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
+import { fsGetRevenue, fsSaveRevenue, fsGetAbsences, fsSaveAbsences,
+         fsGetEmployees, fsSaveEmployees, fsGetHistory, fsSaveHistory } from './firebase';
 
 const TAX_RATE = 0.33;
 const INDIVIDUAL_RATE = 0.29;
@@ -6,26 +8,7 @@ const HISTORY_KEY = "maguje_history";
 const APP_PASSWORD = "maguje2026";
 const SESSION_KEY = "maguje_auth";
 
-// ── Persistência por mês ──────────────────────────────────────
-function loadMonthData(month) {
-  try {
-    const rev = JSON.parse(localStorage.getItem(`maguje_revenue_v2_${month}`) || "{}");
-    const abs = JSON.parse(localStorage.getItem(`maguje_absences_v2_${month}`) || "{}");
-    return { rev, abs };
-  } catch { return { rev: {}, abs: {} }; }
-}
-function saveRevenueForMonth(month, revenue) {
-  localStorage.setItem(`maguje_revenue_v2_${month}`, JSON.stringify(revenue));
-}
-function saveAbsencesForMonth(month, absences) {
-  localStorage.setItem(`maguje_absences_v2_${month}`, JSON.stringify(absences));
-}
-function loadEmployees() {
-  try { const s = localStorage.getItem("maguje_employees_v2"); return s ? JSON.parse(s) : null; } catch { return null; }
-}
-function saveEmployees(emps) { localStorage.setItem("maguje_employees_v2", JSON.stringify(emps)); }
-function loadHistory() { try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]"); } catch { return []; } }
-function saveHistory(records) { localStorage.setItem(HISTORY_KEY, JSON.stringify(records)); }
+// Persistência: Firebase Firestore — funções em firebase.js
 
 // ── Fuzzy match com prefixo ───────────────────────────────────
 function fuzzyMatchEmployee(rawName, employees) {
@@ -451,37 +434,63 @@ function MainApp() {
   const now = new Date();
   const initialMonth = now.getFullYear() + "-" + String(now.getMonth() + 1).padStart(2, "0");
   const [month, setMonth] = useState(initialMonth);
-  const [employees, setEmployees] = useState(() => loadEmployees() || INITIAL_EMPLOYEES);
+  const [employees, setEmployees] = useState(INITIAL_EMPLOYEES);
   const [step, setStep] = useState("revenue");
   const [sector, setSector] = useState("Todos");
   const [showAdd, setShowAdd] = useState(false);
   const [newEmp, setNewEmp] = useState({ name: "", role: "", sector: "Salão", type: "individual", points: 15 });
   const [editingEmpId, setEditingEmpId] = useState(null);
   const [editingEmpData, setEditingEmpData] = useState(null);
-  const [history, setHistory] = useState(loadHistory);
+  const [history, setHistory] = useState([]);
   const [viewingHistory, setViewingHistory] = useState(null);
   const [showHistory, setShowHistory] = useState(false);
-  const [deductions, setDeductions] = useState({}); // desconto por funcionário
+  const [deductions, setDeductions] = useState({});
   const [importMsg, setImportMsg] = useState(null);
   const [pontoMsg, setPontoMsg] = useState(null);
+  const [appLoading, setAppLoading] = useState(true);
   const printRef = useRef();
   const importInputRef = useRef();
   const pontoInputRef = useRef();
+  const savingEnabled = useRef(false);
 
-  const [dailyRevenue, setDailyRevenue] = useState(() => loadMonthData(initialMonth).rev);
-  const [absences, setAbsences]         = useState(() => loadMonthData(initialMonth).abs);
+  const [dailyRevenue, setDailyRevenue] = useState({});
+  const [absences, setAbsences]         = useState({});
 
-  useEffect(() => { saveRevenueForMonth(month, dailyRevenue); }, [dailyRevenue, month]);
-  useEffect(() => { saveAbsencesForMonth(month, absences); }, [absences, month]);
-  useEffect(() => { saveEmployees(employees); }, [employees]);
+  // ── Carga inicial: employees + history + dados do mês ────────
+  useEffect(() => {
+    setAppLoading(true);
+    savingEnabled.current = false;
+    Promise.all([
+      fsGetEmployees(),
+      fsGetHistory(),
+      fsGetRevenue(initialMonth),
+      fsGetAbsences(initialMonth),
+    ]).then(([emps, hist, rev, abs]) => {
+      if (emps) setEmployees(emps);
+      if (hist) setHistory(hist);
+      setDailyRevenue(rev || {});
+      setAbsences(abs || {});
+      savingEnabled.current = true;
+      setAppLoading(false);
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Salvar automaticamente quando dados mudam ─────────────────
+  useEffect(() => { if (savingEnabled.current) fsSaveRevenue(month, dailyRevenue); }, [dailyRevenue]);   // eslint-disable-line
+  useEffect(() => { if (savingEnabled.current) fsSaveAbsences(month, absences); },   [absences]);        // eslint-disable-line
+  useEffect(() => { if (savingEnabled.current) fsSaveEmployees(employees); },         [employees]);       // eslint-disable-line
+  useEffect(() => { if (savingEnabled.current) fsSaveHistory(history); },             [history]);         // eslint-disable-line
 
   const handleMonthChange = newMonth => {
+    savingEnabled.current = false;
     setMonth(newMonth);
     setViewingHistory(null);
-    const { rev, abs } = loadMonthData(newMonth);
-    setDailyRevenue(rev);
-    setAbsences(abs);
     setDeductions({});
+    Promise.all([fsGetRevenue(newMonth), fsGetAbsences(newMonth)]).then(([rev, abs]) => {
+      setDailyRevenue(rev || {});
+      setAbsences(abs || {});
+      savingEnabled.current = true;
+    });
   };
 
   const [year, mon] = month.split("-").map(Number);
@@ -556,7 +565,7 @@ function MainApp() {
   const handleSaveHistory = () => {
     const record = { monthKey: month, year, mon, monthLabel, savedAt: new Date().toISOString(), employees, results, totalBruto: results.totalBruto };
     const updated = [record, ...history.filter(h => h.monthKey !== month)].slice(0, 24);
-    setHistory(updated); saveHistory(updated);
+    setHistory(updated); // auto-salvo pelo useEffect → fsSaveHistory
     alert("Comissões de " + monthLabel + " salvas!");
   };
 
@@ -871,6 +880,16 @@ function MainApp() {
       color: msg.type === "success" ? "#155724" : msg.type === "error" ? "#721c24" : "#856404",
       border: "1px solid " + (msg.type === "success" ? "#c3e6cb" : msg.type === "error" ? "#f5c6cb" : "#ffeeba"),
       maxWidth: 360 }}>{msg.text}</div>
+  );
+
+  if (appLoading) return (
+    <div style={{ display:"flex", alignItems:"center", justifyContent:"center",
+      height:"100vh", background:"#F5F0E8", flexDirection:"column", gap:16 }}>
+      <div style={{ fontSize:36 }}>🔥</div>
+      <div style={{ color:"#7B5EA7", fontWeight:700, fontSize:18, fontFamily:"Space Grotesk,sans-serif" }}>
+        Carregando dados...
+      </div>
+    </div>
   );
 
   return (
