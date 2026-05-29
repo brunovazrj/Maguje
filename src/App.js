@@ -421,9 +421,13 @@ function calcResults(employees, workDays, dailyRevenue, absences) {
     if (emp.mei) empTotals[emp.id] = empTotals[emp.id] / (1 - TAX_RATE);
   });
 
-  // Valor do ponto por grupo (total da comissão / total de pontos acumulados)
-  const g1PontoValue = g1TotalPts > 0 ? g1TotalPool / g1TotalPts : 0;
-  const g2PontoValue = g2TotalPts > 0 ? g2TotalPool / g2TotalPts : 0;
+  // Valor do ponto por grupo: total que o grupo recebe / soma dos pontos fixos dos funcionários do grupo
+  const g1Emps = globalEmployees.filter(e => ["Salão", "Bar", "Caixa"].includes(e.sector));
+  const g2Emps = globalEmployees.filter(e => ["Cozinha", "Limpeza"].includes(e.sector));
+  const g1RawPts = g1Emps.reduce((s, e) => s + e.points, 0);
+  const g2RawPts = g2Emps.reduce((s, e) => s + e.points, 0);
+  const g1PontoValue = g1RawPts > 0 ? g1TotalPool / g1RawPts : 0;
+  const g2PontoValue = g2RawPts > 0 ? g2TotalPool / g2RawPts : 0;
 
   return { empTotals, totalBruto, totalIndivComm, totalGlobalPool, g1PontoValue, g2PontoValue };
 }
