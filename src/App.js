@@ -24,7 +24,13 @@ function fuzzyMatchEmployee(rawName, employees) {
       appWords.some(app => app === ex || app.startsWith(ex) || ex.startsWith(app))
     ).length;
     if (overlap < 2) continue;
-    const score = overlap / Math.max(exWords.length, appWords.length, 1);
+    let score = overlap / Math.max(exWords.length, appWords.length, 1);
+    // Bônus: último sobrenome coincide — evita confundir nomes similares
+    const exLast = exWords[exWords.length - 1];
+    const appLast = appWords[appWords.length - 1];
+    if (exLast && appLast && (exLast === appLast || exLast.startsWith(appLast) || appLast.startsWith(exLast))) {
+      score += 0.25;
+    }
     if (score > bestScore) { bestScore = score; best = emp; }
   }
   return best && bestScore > 0.2 ? best : null;
@@ -355,6 +361,18 @@ function calcResults(employees, workDays, dailyRevenue, absences) {
   const empTotals = {};
   employees.forEach(e => (empTotals[e.id] = 0));
   let totalBruto = 0, totalIndivComm = 0, totalGlobalPool = 0;
+  let g1TotalPool = 0, g2TotalPool = 0, g1TotalPts = 0, g2TotalPts = 0;
+
+  // R (rescisão): determina o dia de desligamento de cada funcionário
+  const terminationDay = {};
+  employees.forEach(emp => {
+    const rDays = Object.keys(absences[emp.id] || {})
+      .filter(d => (absences[emp.id] || {})[d] === "R")
+      .map(Number);
+    if (rDays.length > 0) terminationDay[emp.id] = Math.min(...rDays);
+  });
+  // Ativo = sem R, ou dia <= dia do R (o dia marcado ainda conta; depois dele não)
+  const isActive = (empId, day) => terminationDay[empId] === undefined || day <= terminationDay[empId];
 
   workDays.forEach(day => {
     const dr = getDayRevenue(day);
@@ -363,13 +381,14 @@ function calcResults(employees, workDays, dailyRevenue, absences) {
     totalBruto += globalBruto;
     let indivContribToGlobal = 0;
     indivEmployees.forEach(emp => {
+      if (!isActive(emp.id, day)) return; // ignorar após rescisão
       const sale = parseFloat((dr.individual || {})[emp.id]) || 0;
       totalBruto += sale;
       const net = sale * (1 - TAX_RATE);
       indivContribToGlobal += net * (1 - INDIVIDUAL_RATE); // 71% → pool global
       const status = getStatus(emp.id, day);
       if (status === "F" || status === "A") return;
-      const factor = status === "E" ? 0.5 : 1;
+      const factor = (status === "E" || status === "VB") ? 0.5 : 1; // E e VB = 50%
       const garcomComm = net * INDIVIDUAL_RATE * factor; // 29% → garçom
       empTotals[emp.id] = (empTotals[emp.id] || 0) + garcomComm;
       totalIndivComm += garcomComm;
@@ -377,9 +396,10 @@ function calcResults(employees, workDays, dailyRevenue, absences) {
     const totalDayGlobalPool = globalNet + indivContribToGlobal;
     totalGlobalPool += totalDayGlobalPool;
     const getEffPts = emp => {
+      if (!isActive(emp.id, day)) return 0; // ignorar após rescisão
       const s = getStatus(emp.id, day);
       if (s === "F" || s === "A") return 0;
-      if (s === "E") return emp.points * 0.5;
+      if (s === "E" || s === "VB") return emp.points * 0.5; // E e VB = 50%
       return emp.points;
     };
     const g1Pool = totalDayGlobalPool * 0.73; // Salão + Caixa + Bar
@@ -388,6 +408,10 @@ function calcResults(employees, workDays, dailyRevenue, absences) {
     const g2 = globalEmployees.filter(e => ["Cozinha", "Limpeza"].includes(e.sector));
     const g1Pts = g1.reduce((s, e) => s + getEffPts(e), 0);
     const g2Pts = g2.reduce((s, e) => s + getEffPts(e), 0);
+    g1TotalPool += g1Pool;
+    g2TotalPool += g2Pool;
+    g1TotalPts += g1Pts;
+    g2TotalPts += g2Pts;
     g1.forEach(e => { const p = getEffPts(e); if (g1Pts > 0 && p > 0) empTotals[e.id] = (empTotals[e.id] || 0) + (p / g1Pts) * g1Pool; });
     g2.forEach(e => { const p = getEffPts(e); if (g2Pts > 0 && p > 0) empTotals[e.id] = (empTotals[e.id] || 0) + (p / g2Pts) * g2Pool; });
   });
@@ -397,7 +421,11 @@ function calcResults(employees, workDays, dailyRevenue, absences) {
     if (emp.mei) empTotals[emp.id] = empTotals[emp.id] / (1 - TAX_RATE);
   });
 
-  return { empTotals, totalBruto, totalIndivComm, totalGlobalPool };
+  // Valor do ponto por grupo (total da comissão / total de pontos acumulados)
+  const g1PontoValue = g1TotalPts > 0 ? g1TotalPool / g1TotalPts : 0;
+  const g2PontoValue = g2TotalPts > 0 ? g2TotalPool / g2TotalPts : 0;
+
+  return { empTotals, totalBruto, totalIndivComm, totalGlobalPool, g1PontoValue, g2PontoValue };
 }
 
 // ── Comissão líquida com descontos redistribuídos ─────────────
@@ -510,13 +538,15 @@ function MainApp() {
   const toggleAbsence = (empId, day) =>
     setAbsences(p => {
       const cur = (p[empId] || {})[day] || null;
-      const next = cur === null ? "F" : cur === "F" ? "E" : cur === "E" ? "A" : null;
+      const next = cur === null ? "F" : cur === "F" ? "E" : cur === "E" ? "A" : cur === "A" ? "VB" : cur === "VB" ? "R" : null;
       return { ...p, [empId]: { ...(p[empId] || {}), [day]: next } };
     });
 
   const faltaCountByEmp = empId => workDays.filter(d => getStatus(empId, d) === "F").length;
   const esqCountByEmp   = empId => workDays.filter(d => getStatus(empId, d) === "E").length;
   const atestCountByEmp = empId => workDays.filter(d => getStatus(empId, d) === "A").length;
+  const vbCountByEmp    = empId => workDays.filter(d => getStatus(empId, d) === "VB").length;
+  const rCountByEmp     = empId => workDays.filter(d => getStatus(empId, d) === "R").length;
 
   const toggleEmpMei = empId =>
     setEmployees(p => p.map(e => e.id === empId ? { ...e, mei: !e.mei } : e));
@@ -855,12 +885,15 @@ function MainApp() {
 
   const AbsBadges = ({ empId }) => {
     const fC = faltaCountByEmp(empId), eC = esqCountByEmp(empId), aC = atestCountByEmp(empId);
+    const vbC = vbCountByEmp(empId), rC = rCountByEmp(empId);
     return (
       <>
-        {fC > 0 && <span style={{ fontSize: 11, padding: "2px 6px", background: "#fdecea", color: "#c0392b", borderRadius: 10, fontWeight: 600, marginRight: 2 }}>{fC}F</span>}
-        {eC > 0 && <span style={{ fontSize: 11, padding: "2px 6px", background: "#fff3cd", color: "#7a5c00", borderRadius: 10, fontWeight: 600, marginRight: 2 }}>{eC}E</span>}
-        {aC > 0 && <span style={{ fontSize: 11, padding: "2px 6px", background: "#dbeafe", color: "#1a6fa0", borderRadius: 10, fontWeight: 600 }}>{aC}A</span>}
-        {fC === 0 && eC === 0 && aC === 0 && <span style={{ color: "#ccc", fontSize: 12 }}>—</span>}
+        {fC  > 0 && <span style={{ fontSize: 11, padding: "2px 6px", background: "#fdecea", color: "#c0392b", borderRadius: 10, fontWeight: 600, marginRight: 2 }}>{fC}F</span>}
+        {eC  > 0 && <span style={{ fontSize: 11, padding: "2px 6px", background: "#fff3cd", color: "#7a5c00", borderRadius: 10, fontWeight: 600, marginRight: 2 }}>{eC}E</span>}
+        {aC  > 0 && <span style={{ fontSize: 11, padding: "2px 6px", background: "#dbeafe", color: "#1a6fa0", borderRadius: 10, fontWeight: 600, marginRight: 2 }}>{aC}A</span>}
+        {vbC > 0 && <span style={{ fontSize: 11, padding: "2px 6px", background: "#efebe9", color: "#5d4037", borderRadius: 10, fontWeight: 600, marginRight: 2 }}>{vbC}VB</span>}
+        {rC  > 0 && <span style={{ fontSize: 11, padding: "2px 6px", background: "#eceff1", color: "#37474f", borderRadius: 10, fontWeight: 600 }}>R</span>}
+        {fC === 0 && eC === 0 && aC === 0 && vbC === 0 && rC === 0 && <span style={{ color: "#ccc", fontSize: 12 }}>—</span>}
       </>
     );
   };
@@ -902,6 +935,8 @@ function MainApp() {
         .absent-btn.marked-f { background:#c0392b; border-color:#c0392b; color:#fff; }
         .absent-btn.marked-e { background:#f39c12; border-color:#e67e22; color:#fff; }
         .absent-btn.marked-a { background:#2980b9; border-color:#1a6fa0; color:#fff; }
+        .absent-btn.marked-vb { background:#5d4037; border-color:#4e342e; color:#fff; }
+        .absent-btn.marked-r  { background:#37474f; border-color:#263238; color:#fff; }
         .absent-btn:hover { border-color:#888; }
         .row-hover:hover td { background:#fafaf7 !important; }
         ::-webkit-scrollbar { height:5px; width:5px; } ::-webkit-scrollbar-thumb { background:#ccc; border-radius:3px; }
@@ -1114,12 +1149,14 @@ function MainApp() {
         {!viewingHistory && step === "absences" && (
           <>
             <div style={{ ...S.card, marginBottom: 16 }}>
-              <div style={{ fontSize: 11, color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Tipos de marcação · Clique para ciclar: · → F → E → A → ·</div>
+              <div style={{ fontSize: 11, color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Tipos de marcação · Clique para ciclar: · → F → E → A → VB → R → ·</div>
               <div style={{ display: "flex", gap: 16, flexWrap: "wrap", fontSize: 12, color: "#555" }}>
                 {[
-                  { code: "F", bg: "#c0392b", label: "Falta", sub: "sem comissão" },
-                  { code: "E", bg: "#f39c12", label: "Esquecimento de batida", sub: "50% da comissão" },
-                  { code: "A", bg: "#2980b9", label: "Atestado médico", sub: "sem comissão" },
+                  { code: "F",  bg: "#c0392b", label: "Falta",                   sub: "sem comissão" },
+                  { code: "E",  bg: "#f39c12", label: "Esquecimento de batida",   sub: "50% da comissão" },
+                  { code: "A",  bg: "#2980b9", label: "Atestado médico",          sub: "sem comissão" },
+                  { code: "VB", bg: "#5d4037", label: "Vale Benefício",           sub: "50% da comissão" },
+                  { code: "R",  bg: "#37474f", label: "Rescisão",                 sub: "não participa a partir desta data" },
                 ].map(t => (
                   <div key={t.code} style={{ display: "flex", alignItems: "center", gap: 6 }}>
                     <span style={{ width: 26, height: 26, borderRadius: 4, background: t.bg, color: "#fff", display: "inline-flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 12 }}>{t.code}</span>
@@ -1196,10 +1233,10 @@ function MainApp() {
                           </td>
                           {workDays.map(d => {
                             const status = getStatus(emp.id, d);
-                            const bgMap = { F: "#fdecea", E: "#fff8ee", A: "#dbeafe" };
+                            const bgMap = { F: "#fdecea", E: "#fff8ee", A: "#dbeafe", VB: "#efebe9", R: "#eceff1" };
                             return (
                               <td key={d} style={{ ...S.td, textAlign: "center", padding: "5px 4px", background: bgMap[status] || (idx % 2 === 0 ? "#fff" : "#fafaf8") }}>
-                                <button className={"absent-btn" + (status === "F" ? " marked-f" : status === "E" ? " marked-e" : status === "A" ? " marked-a" : "")}
+                                <button className={"absent-btn" + (status === "F" ? " marked-f" : status === "E" ? " marked-e" : status === "A" ? " marked-a" : status === "VB" ? " marked-vb" : status === "R" ? " marked-r" : "")}
                                   onClick={() => toggleAbsence(emp.id, d)}
                                   title={status === "F" ? "Falta" : status === "E" ? "Esquecimento (50%)" : status === "A" ? "Atestado" : "Presente"}>
                                   {status || "·"}
@@ -1230,7 +1267,7 @@ function MainApp() {
             sector={sector} setSector={setSector} S={S} SECTORS={SECTORS} SECTOR_COLORS={SECTOR_COLORS} fmt={fmt}
             onPrint={handlePrint} onExcelExport={handleExportExcel} onSave={handleSaveHistory} showSave={true}
             deductions={deductions} setDeductions={setDeductions}
-            absCountFns={{ falta: faltaCountByEmp, esq: esqCountByEmp, atest: atestCountByEmp }}
+            absCountFns={{ falta: faltaCountByEmp, esq: esqCountByEmp, atest: atestCountByEmp, vb: vbCountByEmp, r: rCountByEmp }}
             isHistory={false}
             onToggleMei={toggleEmpMei}
             onEditEmp={startEditEmp}
@@ -1254,7 +1291,9 @@ function ResultsTable({ emps, res, nc, sector, setSector, S, SECTORS, SECTOR_COL
   const filteredEmps = sector === "Todos" ? emps : emps.filter(e => e.sector === sector);
   const totalComm = filteredEmps.reduce((s, e) => s + (nc[e.id] || 0), 0);
   const totalDed  = emps.reduce((s, e) => s + (parseFloat(deductions[e.id]) || 0), 0);
-  const { falta: faltaFn, esq: esqFn, atest: atestFn } = absCountFns || { falta: () => 0, esq: () => 0, atest: () => 0 };
+  const { falta: faltaFn, esq: esqFn, atest: atestFn, vb: vbFn, r: rFn } =
+    absCountFns || { falta: () => 0, esq: () => 0, atest: () => 0, vb: () => 0, r: () => 0 };
+  const fmtPt = v => (v || 0).toLocaleString("pt-BR", { minimumFractionDigits: 4, maximumFractionDigits: 4 });
 
   return (
     <>
@@ -1264,6 +1303,8 @@ function ResultsTable({ emps, res, nc, sector, setSector, S, SECTORS, SECTOR_COL
           { label: "Pool Global Líq.", val: fmt(res.totalGlobalPool), color: "#40916C" },
           { label: "Comissões Indiv.", val: fmt(res.totalIndivComm), color: "#7B5EA7" },
           { label: "Total Distribuído", val: fmt(filteredEmps.reduce((s,e)=>s+(nc[e.id]||0),0)), color: "#B5450B" },
+          { label: "Vl. Ponto G1 (Salão/Bar/Cx)", val: fmtPt(res.g1PontoValue), color: "#2D6A4F" },
+          { label: "Vl. Ponto G2 (Coz/Limp)", val: fmtPt(res.g2PontoValue), color: "#B5450B" },
         ].map(m => (
           <div key={m.label} style={{ background: "#fff", border: "1.5px solid #D4CFC4", borderRadius: 4, padding: "13px 16px", textAlign: "center" }}>
             <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: 17, color: m.color }}>{m.val}</div>
@@ -1326,7 +1367,7 @@ function ResultsTable({ emps, res, nc, sector, setSector, S, SECTORS, SECTOR_COL
               const comm = nc[emp.id] || 0;
               const base = res.empTotals[emp.id] || 0;
               const ded  = parseFloat(deductions[emp.id]) || 0;
-              const fC = faltaFn(emp.id), eC = esqFn(emp.id), aC = atestFn(emp.id);
+              const fC = faltaFn(emp.id), eC = esqFn(emp.id), aC = atestFn(emp.id), vbC = vbFn(emp.id), rC = rFn(emp.id);
               const color = SECTOR_COLORS[emp.sector] || "#555";
               const hasDiscount = ded > 0;
               return (
@@ -1353,10 +1394,12 @@ function ResultsTable({ emps, res, nc, sector, setSector, S, SECTORS, SECTOR_COL
                       : <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 20, background: "#2D6A4F20", color: "#2D6A4F", border: "1px solid #2D6A4F40" }}>Global · {emp.points}pts</span>}
                   </td>
                   <td style={{ ...S.td, textAlign: "center", background: idx % 2 === 0 ? "#fff" : "#fafaf8" }}>
-                    {fC > 0 && <span style={{ background: "#fdecea", color: "#c0392b", borderRadius: 10, padding: "2px 6px", fontSize: 11, fontWeight: 600, marginRight: 2 }}>{fC}F</span>}
-                    {eC > 0 && <span style={{ background: "#fff3cd", color: "#7a5c00", borderRadius: 10, padding: "2px 6px", fontSize: 11, fontWeight: 600, marginRight: 2 }}>{eC}E</span>}
-                    {aC > 0 && <span style={{ background: "#dbeafe", color: "#1a6fa0", borderRadius: 10, padding: "2px 6px", fontSize: 11, fontWeight: 600 }}>{aC}A</span>}
-                    {fC === 0 && eC === 0 && aC === 0 && <span style={{ color: "#ccc", fontSize: 12 }}>—</span>}
+                    {fC  > 0 && <span style={{ background: "#fdecea", color: "#c0392b", borderRadius: 10, padding: "2px 6px", fontSize: 11, fontWeight: 600, marginRight: 2 }}>{fC}F</span>}
+                    {eC  > 0 && <span style={{ background: "#fff3cd", color: "#7a5c00", borderRadius: 10, padding: "2px 6px", fontSize: 11, fontWeight: 600, marginRight: 2 }}>{eC}E</span>}
+                    {aC  > 0 && <span style={{ background: "#dbeafe", color: "#1a6fa0", borderRadius: 10, padding: "2px 6px", fontSize: 11, fontWeight: 600, marginRight: 2 }}>{aC}A</span>}
+                    {vbC > 0 && <span style={{ background: "#efebe9", color: "#5d4037", borderRadius: 10, padding: "2px 6px", fontSize: 11, fontWeight: 600, marginRight: 2 }}>{vbC}VB</span>}
+                    {rC  > 0 && <span style={{ background: "#eceff1", color: "#37474f", borderRadius: 10, padding: "2px 6px", fontSize: 11, fontWeight: 600 }}>R</span>}
+                    {fC === 0 && eC === 0 && aC === 0 && vbC === 0 && rC === 0 && <span style={{ color: "#ccc", fontSize: 12 }}>—</span>}
                   </td>
                   {!isHistory && (
                     <td style={{ ...S.td, textAlign: "center", background: idx % 2 === 0 ? "#fff" : "#fafaf8" }}>
