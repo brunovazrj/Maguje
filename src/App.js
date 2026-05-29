@@ -362,6 +362,8 @@ function calcResults(employees, workDays, dailyRevenue, absences) {
   employees.forEach(e => (empTotals[e.id] = 0));
   let totalBruto = 0, totalIndivComm = 0, totalGlobalPool = 0;
   let g1TotalPool = 0, g2TotalPool = 0, g1TotalPts = 0, g2TotalPts = 0;
+  const empEffPtsSum = {};
+  globalEmployees.forEach(e => (empEffPtsSum[e.id] = 0));
 
   // R (rescisão): determina o dia de desligamento de cada funcionário
   const terminationDay = {};
@@ -412,8 +414,9 @@ function calcResults(employees, workDays, dailyRevenue, absences) {
     g2TotalPool += g2Pool;
     g1TotalPts += g1Pts;
     g2TotalPts += g2Pts;
-    g1.forEach(e => { const p = getEffPts(e); if (g1Pts > 0 && p > 0) empTotals[e.id] = (empTotals[e.id] || 0) + (p / g1Pts) * g1Pool; });
-    g2.forEach(e => { const p = getEffPts(e); if (g2Pts > 0 && p > 0) empTotals[e.id] = (empTotals[e.id] || 0) + (p / g2Pts) * g2Pool; });
+    // Acumula pontos efetivos do mês por funcionário (usado para calcular comissão consistente com valor do ponto)
+    g1.forEach(e => { const p = getEffPts(e); if (p > 0) empEffPtsSum[e.id] += p; });
+    g2.forEach(e => { const p = getEffPts(e); if (p > 0) empEffPtsSum[e.id] += p; });
   });
 
   // MEI: desfaz o desconto de 33%
@@ -421,13 +424,15 @@ function calcResults(employees, workDays, dailyRevenue, absences) {
     if (emp.mei) empTotals[emp.id] = empTotals[emp.id] / (1 - TAX_RATE);
   });
 
-  // Valor do ponto por grupo: total que o grupo recebe / soma dos pontos fixos dos funcionários do grupo
+  // Valor do ponto = total do grupo / total de pontos efetivos do grupo no mês
+  // Comissão individual = pontos efetivos acumulados * valor do ponto (garante consistência)
   const g1Emps = globalEmployees.filter(e => ["Salão", "Bar", "Caixa"].includes(e.sector));
   const g2Emps = globalEmployees.filter(e => ["Cozinha", "Limpeza"].includes(e.sector));
-  const g1RawPts = g1Emps.reduce((s, e) => s + e.points, 0);
-  const g2RawPts = g2Emps.reduce((s, e) => s + e.points, 0);
-  const g1PontoValue = g1RawPts > 0 ? g1TotalPool / g1RawPts : 0;
-  const g2PontoValue = g2RawPts > 0 ? g2TotalPool / g2RawPts : 0;
+  const g1PontoValue = g1TotalPts > 0 ? g1TotalPool / g1TotalPts : 0;
+  const g2PontoValue = g2TotalPts > 0 ? g2TotalPool / g2TotalPts : 0;
+  // Aplica a comissão de cada funcionário global via valor do ponto (consistente com o card)
+  g1Emps.forEach(emp => { empTotals[emp.id] = empEffPtsSum[emp.id] * g1PontoValue; });
+  g2Emps.forEach(emp => { empTotals[emp.id] = empEffPtsSum[emp.id] * g2PontoValue; });
 
   return { empTotals, totalBruto, totalIndivComm, totalGlobalPool, g1PontoValue, g2PontoValue };
 }
@@ -1297,7 +1302,7 @@ function ResultsTable({ emps, res, nc, sector, setSector, S, SECTORS, SECTOR_COL
   const totalDed  = emps.reduce((s, e) => s + (parseFloat(deductions[e.id]) || 0), 0);
   const { falta: faltaFn, esq: esqFn, atest: atestFn, vb: vbFn, r: rFn } =
     absCountFns || { falta: () => 0, esq: () => 0, atest: () => 0, vb: () => 0, r: () => 0 };
-  const fmtPt = v => (v || 0).toLocaleString("pt-BR", { minimumFractionDigits: 4, maximumFractionDigits: 4 });
+  const fmtPt = v => "R$ " + (v || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
   return (
     <>
