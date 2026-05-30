@@ -1298,7 +1298,7 @@ function ResultsTable({ emps, res, nc, sector, setSector, S, SECTORS, SECTOR_COL
   const { falta: faltaFn, esq: esqFn, atest: atestFn, vb: vbFn, r: rFn } =
     absCountFns || { falta: () => 0, esq: () => 0, atest: () => 0, vb: () => 0, r: () => 0 };
   const fmtPt = v => "R$ " + (v || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-
+         
   return (
     <>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 12, marginBottom: 20 }}>
