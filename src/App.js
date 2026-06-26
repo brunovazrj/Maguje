@@ -1027,7 +1027,7 @@ function MainApp() {
               sector={sector} setSector={setSector} S={S} SECTORS={SECTORS} SECTOR_COLORS={SECTOR_COLORS} fmt={fmt}
               onPrint={handlePrint} onExcelExport={handleExportExcel} showSave={false} onSave={null}
               deductions={{}} setDeductions={null}
-              absCountFns={{ falta: () => 0, esq: () => 0, atest: () => 0 }}
+            absCountFns={{ falta: () => 0, esq: () => 0, atest: () => 0, vb: () => 0, r: () => 0 }}
               isHistory={true} onToggleMei={null} onEditEmp={null} onDeleteEmp={null} />
           </>
         )}
