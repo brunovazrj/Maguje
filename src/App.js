@@ -418,7 +418,7 @@ function calcResults(employees, workDays, dailyRevenue, absences) {
 
   // MEI: desfaz o desconto de 33%
   employees.forEach(emp => {
-    if (emp.mei) empTotals[emp.id] = empTotals[emp.id] / (1 - TAX_RATE);
+if (emp.mei) empTotals[emp.id] = empTotals[emp.id] * (1 + TAX_RATE);
   });
 
   // Valor do ponto por grupo: total que o grupo recebe / soma dos pontos fixos dos funcionários do grupo
